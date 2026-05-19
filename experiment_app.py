@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -46,10 +47,19 @@ from run_experiment import (  # noqa: E402
     temporal_train_test_split,
     train_quantile_lgbm,
     _import_optimizer,
+    _robust_fill_enhanced_env_features,
     _sanitize_xy,
 )
 from run_experiment import COL_TARGET  # noqa: E402
+from frontier_physics_constants import (  # noqa: E402
+    FRONTIER_PHYSICS_BLOCKS,
+    audit_frontier_physics_features,
+)
 from data_pipeline import EnvironmentalDataPipeline, PipelineConfig  # noqa: E402
+from environmental_feature_engineer import (  # noqa: E402
+    enrich_market_physics_inputs,
+    merge_frontier_physics_features,
+)
 
 # 工业级默认回溯窗口：30 天 × 24h，保证 LightGBM 有足够样本学习环境长尾微特征
 PIPELINE_LOOKBACK_HOURS: int = 720
@@ -250,8 +260,14 @@ def run_experiment_with_status(
                 )
             tables = load_raw_tables(config.data_dir)
 
+        # 补齐前沿物理原始输入（湿度/100m风/反照率/沙尘等）并二次计算四大物理特征
+        tables = enrich_market_physics_inputs(tables, schema=config.schema)
         df_wide = build_enhanced_wide_table(tables, schema=config.schema)
+        st.write("正在计算四大前沿物理微特征（酷热/风切变/反照率/积尘）...")
+        df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
         df_wide = add_model_ready_features(df_wide)
+        df_wide = _robust_fill_enhanced_env_features(df_wide)
+        st.session_state["frontier_physics_audit"] = audit_frontier_physics_features(df_wide)
 
         missing = [c for c in required_cols if c not in df_wide.columns]
         if missing:
@@ -342,6 +358,8 @@ def run_experiment_with_status(
         env_importance=env_imp,
         test_forecast=test_forecast,
         enhanced_full_importance=full_imp,
+        model_enhanced=model_enh,
+        X_test_enhanced=X_test_e.copy(),
     )
 
 
@@ -507,6 +525,127 @@ def plot_feature_importance(importance_df: pd.DataFrame, top_n: int = 12) -> go.
     return fig
 
 
+def compute_frontier_physics_shap(
+    model: Any,
+    X_test: pd.DataFrame,
+    max_samples: int = 280,
+) -> Optional[pd.DataFrame]:
+    """
+    计算四大前沿物理因子板块的 mean |SHAP| 贡献（测试集样本）。
+
+    用于解释增强模型相对基准的微观物理超额贡献。
+    """
+    try:
+        import shap
+    except ImportError:
+        return None
+
+    if model is None or X_test is None or X_test.empty:
+        return None
+
+    sample = X_test
+    if len(sample) > max_samples:
+        sample = sample.sample(max_samples, random_state=42)
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(sample)
+
+    if isinstance(shap_values, list):
+        shap_arr = np.asarray(shap_values[0])
+    else:
+        shap_arr = np.asarray(shap_values)
+
+    if shap_arr.ndim == 3:
+        shap_arr = shap_arr[:, :, 0]
+
+    mean_abs = np.mean(np.abs(shap_arr), axis=0)
+    feat_shap = pd.Series(mean_abs, index=sample.columns)
+
+    rows: list[dict[str, object]] = []
+    for block, cols in FRONTIER_PHYSICS_BLOCKS.items():
+        present = [c for c in cols if c in feat_shap.index]
+        if not present:
+            rows.append(
+                {
+                    "physics_block": block,
+                    "mean_abs_shap": 0.0,
+                    "features": "",
+                }
+            )
+            continue
+        rows.append(
+            {
+                "physics_block": block,
+                "mean_abs_shap": float(feat_shap[present].sum()),
+                "features": ", ".join(present),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("mean_abs_shap", ascending=False)
+
+
+def plot_frontier_shap_bar(shap_summary: pd.DataFrame) -> go.Figure:
+    """前沿物理板块 SHAP 贡献条形图。"""
+    df = shap_summary.sort_values("mean_abs_shap", ascending=True)
+    fig = go.Figure(
+        go.Bar(
+            x=df["mean_abs_shap"],
+            y=df["physics_block"],
+            orientation="h",
+            marker_color="#7c3aed",
+            text=df["mean_abs_shap"].round(4),
+            textposition="outside",
+        )
+    )
+    fig.update_layout(
+        title="四大前沿物理因子 · 平均 |SHAP| 超额贡献",
+        xaxis_title="Mean |SHAP| (测试集)",
+        yaxis_title="",
+        template="plotly_white",
+        height=360,
+    )
+    return fig
+
+
+def render_frontier_shap_panel(report: ExperimentReport) -> None:
+    """在特征重要性旁展示 SHAP 物理解释模块。"""
+    st.subheader("前沿物理因子 · SHAP 实时解释")
+    st.caption(
+        "基于增强模型在测试集上的 TreeSHAP，聚合四大微观物理板块的 |SHAP| 强度，"
+        "量化其在打擂台中的超额边际贡献（非因果效应，仅供业务解读）。"
+    )
+
+    audit = st.session_state.get("frontier_physics_audit")
+    if audit:
+        cols = st.columns(4)
+        for col, (block, ok) in zip(cols, audit.items(), strict=False):
+            col.metric(block.split()[0], "已并入" if ok else "缺失", delta=None)
+
+    if report.model_enhanced is None or report.X_test_enhanced is None:
+        st.info("请先完成一次擂台实验以生成 SHAP 解释。")
+        return
+
+    with st.spinner("正在计算 TreeSHAP（前沿物理板块）..."):
+        shap_df = compute_frontier_physics_shap(
+            report.model_enhanced,
+            report.X_test_enhanced,
+        )
+
+    if shap_df is None:
+        st.warning("未安装 ``shap`` 库。请执行: pip install shap")
+        return
+
+    c1, c2 = st.columns([1.1, 1])
+    with c1:
+        st.plotly_chart(plot_frontier_shap_bar(shap_df), use_container_width=True)
+    with c2:
+        st.dataframe(
+            shap_df.style.format({"mean_abs_shap": "{:.5f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def render_charts(report: ExperimentReport) -> None:
     """渲染 Plotly 图表区。"""
     if report.test_forecast is None or report.enhanced_full_importance is None:
@@ -532,6 +671,8 @@ def render_charts(report: ExperimentReport) -> None:
             plot_feature_importance(report.enhanced_full_importance),
             use_container_width=True,
         )
+
+    render_frontier_shap_panel(report)
 
     st.subheader("环境因子专项排名")
     st.dataframe(

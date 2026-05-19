@@ -37,6 +37,8 @@ if str(_PROJECT_ROOT) not in sys.path:
 from environmental_feature_engineer import (  # noqa: E402
     FeatureSchema,
     align_and_merge_all,
+    enrich_market_physics_inputs,
+    merge_frontier_physics_features,
     process_pollution_interaction,
     process_radiation_features,
 )
@@ -58,11 +60,27 @@ BENCHMARK_FEATURE_COLUMNS: tuple[str, ...] = (
     "wind_speed",
 )
 
-# 增强模型新增：空间加权辐射、辐射突变率、污染×负荷交叉、水温时滞
+# 微观物理因子（四大前沿板块核心字段，增强模型显式纳入）
+MICRO_PHYSICS_FEATURE_COLUMNS: tuple[str, ...] = (
+    "heat_index",
+    "heat_index_spike_35",
+    "wind_shear_coefficient",  # 幂律切变系数 α，与特征工程 wind_shear_alpha 同源
+    "wake_effect_intensity",
+    "snow_melt_rate",
+    "bifacial_gain_index",
+    "panel_efficiency_discount",
+)
+
+# 增强模型新增：经典环境工程 + 微观物理 + 切变/积尘辅助 + 水温时滞
 ENHANCED_ENV_COLUMNS: tuple[str, ...] = (
     "effective_pv_radiation",
     "radiation_mutation_rate",
     "pm25_load_cross_prov_weighted",
+    *MICRO_PHYSICS_FEATURE_COLUMNS,
+    "wind_shear_alpha",
+    "wind_shear_risk",
+    "wind_dir_dev",
+    "panel_dirt_accumulation",
     "water_temp_lag_1h",
     "water_temp_lag_3h",
     "water_temp_lag_6h",
@@ -131,6 +149,8 @@ class ExperimentReport:
     # 供 Web 可视化：测试集时序预测与增强模型全量特征重要性
     test_forecast: Optional[pd.DataFrame] = None
     enhanced_full_importance: Optional[pd.DataFrame] = None
+    model_enhanced: Any = None
+    X_test_enhanced: Optional[pd.DataFrame] = None
 
 
 # ---------------------------------------------------------------------------
@@ -321,16 +341,60 @@ def build_synthetic_raw_tables(n_hours: int = 720) -> dict[str, pd.DataFrame]:
                 }
             )
 
-    base_price = 320.0 + 60.0 * np.sin(np.arange(n_hours) / 24.0)
+    t_idx = np.arange(n_hours, dtype=float)
+    hour_of_day = hours.hour.to_numpy()
+    evening_peak = ((hour_of_day >= 17) & (hour_of_day <= 21)).astype(float)
+    temperature = 12.0 + 8.0 * np.sin(t_idx / 24.0) + rng.normal(0, 0.5, n_hours)
+    relative_humidity = np.clip(
+        62.0 + 18.0 * np.sin(t_idx / 24.0 * 2.0 * np.pi)
+        + 6.0 * np.maximum(0.0, temperature - 22.0)
+        + rng.normal(0, 2.0, n_hours),
+        25.0,
+        98.0,
+    )
+    wind_speed = np.clip(4.0 + 2.0 * rng.standard_normal(n_hours), 0.1, None)
+    # 对数风廓线：10m → 100m，并叠加切变扰动使 wind_shear_alpha 有信息量
+    _z0, _z10, _z100 = 0.03, 10.0, 100.0
+    wind_speed_100m = wind_speed * (
+        np.log(_z100 / _z0) / np.log(_z10 / _z0)
+    ) * (1.0 + 0.15 * np.sin(t_idx / 36.0))
+    wind_direction = (180.0 + 90.0 * np.sin(t_idx / 24.0)) % 360.0
+    albedo = np.clip(0.15 + 0.4 * np.maximum(0, np.sin(t_idx / 24.0)), 0, 0.85)
+    snow_depth = np.clip(15.0 - t_idx * 0.02, 0, None)
+    precipitation = np.where(t_idx.astype(int) % 120 == 0, 8.0, 0.2)
+    sand_dust_total = np.clip(50.0 + 120.0 * np.sin(t_idx / 48.0), 20, 300)
+
+    # 电价与前沿物理可观测变量耦合，便于 Demo 擂台展示非零增量
+    heat_stress = np.maximum(0.0, temperature - 26.0) * (relative_humidity / 100.0)
+    wake_proxy = np.exp(-0.5 * ((90.0 - (wind_direction % 360.0)) / 25.0) ** 2)
+    soiling_proxy = sand_dust_total / 300.0
+    base_price = 320.0 + 60.0 * np.sin(t_idx / 24.0)
+    bifacial_proxy = albedo * np.clip(snow_depth / 20.0, 0, 1)
+    spot_price = (
+        base_price
+        + 55.0 * heat_stress * evening_peak
+        + 40.0 * wake_proxy * np.clip(wind_speed_100m - wind_speed, 0, None)
+        + 35.0 * soiling_proxy * (1.0 - np.minimum(precipitation, 10.0) / 10.0)
+        + 25.0 * bifacial_proxy * np.sin(t_idx / 24.0)
+        + rng.normal(0, 10, n_hours)
+    )
+
     market = pd.DataFrame(
         {
             "timestamp": hours,
-            "spot_price": base_price + rng.normal(0, 15, n_hours),
-            "total_load": 11000.0 + 1500 * np.sin(np.arange(n_hours) / 24.0) + rng.normal(0, 100, n_hours),
+            "spot_price": spot_price,
+            "total_load": 11000.0 + 1500 * np.sin(t_idx / 24.0) + rng.normal(0, 100, n_hours),
             "wind_forecast": 800.0 + 200 * rng.standard_normal(n_hours),
-            "solar_forecast": np.clip(600.0 + 300 * np.sin(np.arange(n_hours) / 24.0), 0, None),
-            "temperature": 12.0 + 8.0 * np.sin(np.arange(n_hours) / 24.0) + rng.normal(0, 0.5, n_hours),
-            "wind_speed": 4.0 + 2.0 * rng.standard_normal(n_hours),
+            "solar_forecast": np.clip(600.0 + 300 * np.sin(t_idx / 24.0), 0, None),
+            "temperature": temperature,
+            "relative_humidity": relative_humidity,
+            "wind_speed": wind_speed,
+            "wind_speed_100m": wind_speed_100m,
+            "wind_direction": wind_direction,
+            "albedo": albedo,
+            "snow_depth": snow_depth,
+            "precipitation": precipitation,
+            "sand_dust_total": sand_dust_total,
         }
     )
 
@@ -369,6 +433,7 @@ def build_enhanced_wide_table(
     → ``align_and_merge_all``，与生产特征一致。
     """
     schema = schema or FeatureSchema()
+    tables = enrich_market_physics_inputs(tables, schema=schema)
     df_rad = process_radiation_features(tables["era5"], tables["pv_stations"], schema=schema)
     df_pol = process_pollution_interaction(tables["aqi"], tables["load_base"], schema=schema)
     return align_and_merge_all(
@@ -420,6 +485,31 @@ def temporal_train_test_split(
             "无法得到非空的训练集与测试集。"
         )
     return df.iloc[:split_idx].copy(), df.iloc[split_idx:].copy()
+
+
+def _ensure_wind_shear_coefficient(df: pd.DataFrame) -> pd.DataFrame:
+    """将特征工程输出的 wind_shear_alpha 同步为建模列 wind_shear_coefficient。"""
+    out = df.copy()
+    if "wind_shear_coefficient" not in out.columns and "wind_shear_alpha" in out.columns:
+        out["wind_shear_coefficient"] = out["wind_shear_alpha"]
+    return out
+
+
+def _robust_fill_enhanced_env_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    增强模型环境列 NaN 鲁棒填充：先时间方向 ffill，再 fillna(0)。
+
+    覆盖 MICRO_PHYSICS_FEATURE_COLUMNS 及 ENHANCED_ENV_COLUMNS 全部字段，
+    缺失列补 0，避免 LightGBM 训练因 NaN 报错。
+    """
+    out = _ensure_wind_shear_coefficient(df)
+    fill_cols = list(dict.fromkeys((*ENHANCED_ENV_COLUMNS, *MICRO_PHYSICS_FEATURE_COLUMNS)))
+    for col in fill_cols:
+        if col not in out.columns:
+            out[col] = 0.0
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce").ffill().fillna(0.0)
+    return out
 
 
 def _sanitize_xy(
@@ -609,8 +699,11 @@ def run_experiment(config: ExperimentConfig) -> ExperimentReport:
             raise ValueError("非 demo 模式必须指定 --data-dir。")
         tables = load_raw_tables(config.data_dir)
 
+    tables = enrich_market_physics_inputs(tables, schema=config.schema)
     df_wide = build_enhanced_wide_table(tables, schema=config.schema)
+    df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
     df_wide = add_model_ready_features(df_wide)
+    df_wide = _robust_fill_enhanced_env_features(df_wide)
 
     benchmark_cols = list(BENCHMARK_FEATURE_COLUMNS)
     enhanced_cols = benchmark_cols + list(ENHANCED_ENV_COLUMNS)

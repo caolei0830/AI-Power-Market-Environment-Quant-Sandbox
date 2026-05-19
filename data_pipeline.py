@@ -46,6 +46,10 @@ from environmental_feature_engineer import (  # noqa: E402
     process_pollution_interaction,
     process_radiation_features,
 )
+from frontier_physics_constants import (  # noqa: E402
+    audit_frontier_physics_features,
+    frontier_physics_feature_names,
+)
 
 # ---------------------------------------------------------------------------
 # 日志着色（Windows 终端友好）
@@ -332,6 +336,7 @@ class EnvironmentalDataPipeline:
                         "pm25": 20.0 + 15.0 * np.sin(i / 12.0) + j * 4,
                         "no2": 15.0 + 8.0 * np.cos(i / 18.0) + j * 2,
                         "aod": 0.2 + 0.04 * j + 0.02 * np.sin(i / 24.0),
+                        "pm10": 30.0 + 20.0 * np.sin(i / 18.0) + j * 6,
                     }
                 )
                 load_rows.append(
@@ -398,7 +403,39 @@ class EnvironmentalDataPipeline:
         base_price = 310.0 + 55.0 * np.sin(t / 24.0 * 2 * np.pi)
         peak_mask = ((hours.hour >= 18) & (hours.hour <= 21)).astype(float)
         spike = peak_mask * rng.normal(80, 25, n)
-        spot_price = np.clip(base_price + spike + rng.normal(0, 12, n), 50, 1500)
+        temperature = 8.0 + 10.0 * np.sin(t / 24.0) + rng.normal(0, 0.6, n)
+        relative_humidity = np.clip(
+            62.0 + 18.0 * np.sin(t / 24.0 * 2 * np.pi)
+            + 6.0 * np.maximum(0.0, temperature - 22.0)
+            + rng.normal(0, 2.5, n),
+            25,
+            98,
+        )
+        wind_speed = np.clip(3.5 + 1.8 * rng.standard_normal(n), 0.1, 25)
+        wind_direction = (180.0 + 90.0 * np.sin(t / 24.0)) % 360.0
+        _z0, _z10, _z100 = 0.03, 10.0, 100.0
+        wind_speed_100m = wind_speed * (
+            np.log(_z100 / _z0) / np.log(_z10 / _z0)
+        ) * (1.0 + 0.15 * np.sin(t / 36.0))
+        sand_dust_total = np.clip(40.0 + 180.0 * np.maximum(0, np.sin(t / 72.0)), 10, 400)
+        precipitation = np.where((hours.hour % 24) == 3, rng.uniform(6, 12, n), 0.3)
+        heat_stress = np.maximum(0.0, temperature - 26.0) * (relative_humidity / 100.0)
+        wake_proxy = np.exp(-0.5 * ((90.0 - (wind_direction % 360.0)) / 25.0) ** 2)
+        soiling_proxy = sand_dust_total / 400.0
+        bifacial_proxy = np.clip(0.12 + 0.45 * np.maximum(0, np.sin(t / 24.0)), 0, 0.85) * np.clip(
+            (25.0 - t * 0.08) / 20.0, 0, 1
+        )
+        spot_price = np.clip(
+            base_price
+            + spike
+            + 50.0 * heat_stress * peak_mask
+            + 35.0 * wake_proxy * np.clip(wind_speed_100m - wind_speed, 0, None)
+            + 30.0 * soiling_proxy
+            + 20.0 * bifacial_proxy * np.sin(t / 24.0)
+            + rng.normal(0, 10, n),
+            50,
+            1500,
+        )
 
         market = pd.DataFrame(
             {
@@ -409,8 +446,15 @@ class EnvironmentalDataPipeline:
                 "solar_forecast": np.clip(
                     550.0 + 280.0 * np.sin(t / 24.0 * 2 * np.pi), 0, None
                 ),
-                "temperature": 8.0 + 10.0 * np.sin(t / 24.0) + rng.normal(0, 0.6, n),
-                "wind_speed": np.clip(3.5 + 1.8 * rng.standard_normal(n), 0, 25),
+                "temperature": temperature,
+                "relative_humidity": relative_humidity,
+                "wind_speed": wind_speed,
+                "wind_speed_100m": wind_speed_100m,
+                "wind_direction": wind_direction,
+                "albedo": np.clip(0.12 + 0.45 * np.maximum(0, np.sin(t / 24.0)), 0, 0.85),
+                "snow_depth": np.clip(25.0 - t * 0.08, 0, None),
+                "precipitation": precipitation,
+                "sand_dust_total": sand_dust_total,
             }
         )
 
@@ -598,17 +642,48 @@ class EnvironmentalDataPipeline:
         self._assert_raw_tables_nonempty(raw)
 
         cleaned = {k: self._impute_table(v, k) for k, v in raw.items()}
+        cleaned = self._enrich_market_physics_inputs(cleaned)
         df_ready = self._build_feature_wide_table(cleaned)
 
         # 建模滞后特征（与 run_experiment 保持一致）
         df_ready = self._add_price_and_water_lags(df_ready)
         df_ready = df_ready.sort_values("timestamp").reset_index(drop=True)
 
+        self._log_frontier_physics_audit(df_ready)
+
         store_tables = {"features_ready": df_ready}
         self.store_to_db(store_tables)
 
         log.success(f"特征矩阵对齐完成，样本数: {len(df_ready)}")
         return df_ready
+
+    def _enrich_market_physics_inputs(
+        self,
+        tables: dict[str, pd.DataFrame],
+    ) -> dict[str, pd.DataFrame]:
+        """委托 ``environmental_feature_engineer.enrich_market_physics_inputs``。"""
+        from environmental_feature_engineer import enrich_market_physics_inputs
+
+        return enrich_market_physics_inputs(tables, schema=self.config.schema)
+
+    @staticmethod
+    def _log_frontier_physics_audit(df_ready: pd.DataFrame) -> None:
+        """终端输出前沿物理特征并入 ``features_ready`` 的审计结果。"""
+        audit = audit_frontier_physics_features(df_ready)
+        ok_blocks = [k for k, v in audit.items() if v]
+        miss_blocks = [k for k, v in audit.items() if not v]
+        log.info(
+            f"前沿物理因子并入 features_ready: {len(ok_blocks)}/{len(audit)} 板块完整"
+        )
+        for block in ok_blocks:
+            log.success(f"  [OK] {block}")
+        for block in miss_blocks:
+            log.warn(f"  [MISS] {block} - 缺少列，请检查 market 输入或特征工程链路")
+        missing_cols = [c for c in frontier_physics_feature_names() if c not in df_ready.columns]
+        if missing_cols:
+            log.warn(f"  缺失特征列: {missing_cols}")
+        else:
+            log.success("  全部前沿物理特征列已写入 features_ready 宽表")
 
     def _assert_raw_tables_nonempty(self, raw: dict[str, pd.DataFrame]) -> None:
         missing = [k for k, v in raw.items() if v is None or v.empty]
