@@ -4,17 +4,19 @@ experiment_app.py — 环境微特征电力现货预测增强试验舱（Streaml
 
 启动方式
 --------
-    pip install streamlit plotly
+    pip install streamlit plotly sqlalchemy psycopg2-binary
     streamlit run experiment_app.py
 
 说明
 ----
-- 默认 Demo 模拟数据，无需 CSV 即可完整体验。
-- 实验核心逻辑复用 ``run_experiment.py``，本文件仅负责交互与可视化。
+- 默认连接 PostgreSQL 生产库，从 ``v_features_pipeline_ready`` 读取 SQL 窗口特征宽表。
+- 数据库不可用时自动降级本地 CSV 容灾备份。
+- 实验核心逻辑复用 ``run_experiment.py``，本文件负责交互与可视化。
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -23,21 +25,27 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from sqlalchemy.exc import SQLAlchemyError
 
 # 保证可导入同目录下的实验脚本
 _APP_ROOT = Path(__file__).resolve().parent
 if str(_APP_ROOT) not in sys.path:
     sys.path.insert(0, str(_APP_ROOT))
 
+from db_feature_view import SQL_CREATE_VIEW  # noqa: E402
+from db_injector import DEFAULT_DATABASE_URL, create_db_engine  # noqa: E402
 from run_experiment import (  # noqa: E402
     BENCHMARK_FEATURE_COLUMNS,
     COL_TIMESTAMP,
     ENHANCED_ENV_COLUMNS,
     ExperimentConfig,
     ExperimentReport,
+    PRODUCTION_DATABASE_URL,
     _pct_alpha,
     _pct_improvement,
+    _ensure_feature_view,
     add_model_ready_features,
+    adapt_sql_pipeline_to_model_frame,
     backtest_storage_revenue_yuan,
     build_enhanced_wide_table,
     build_synthetic_raw_tables,
@@ -57,12 +65,25 @@ from frontier_physics_constants import (  # noqa: E402
 )
 from data_pipeline import EnvironmentalDataPipeline, PipelineConfig  # noqa: E402
 from environmental_feature_engineer import (  # noqa: E402
+    FeatureSchema,
     enrich_market_physics_inputs,
     merge_frontier_physics_features,
 )
 
 # 工业级默认回溯窗口：30 天 × 24h，保证 LightGBM 有足够样本学习环境长尾微特征
 PIPELINE_LOOKBACK_HOURS: int = 720
+
+# PostgreSQL 生产库：由库内窗口函数实时产出特征宽表（全节点、时间升序）
+SQL_LOAD_PIPELINE_WIDE = """
+SELECT *
+FROM v_features_pipeline_ready
+ORDER BY timestamp ASC
+"""
+
+CSV_FALLBACK_CANDIDATES: tuple[Path, ...] = (
+    _APP_ROOT / "data" / "features_ready.csv",
+    _APP_ROOT / "data" / "feature_ready.csv",
+)
 
 # ---------------------------------------------------------------------------
 # 页面基础配置
@@ -138,14 +159,90 @@ def render_banner() -> None:
         """
         <div class="main-banner">
             <h1>量化前沿：环境微特征（辐射/污染/水温）电力电价预测增强试验舱</h1>
-            <p>Quant Frontier Lab · ERA5 容量加权辐射 × 污染负荷交叉 × 储能套利经济价值实证</p>
+            <p>Quant Frontier Lab · PostgreSQL 窗口算力 × 储能套利经济价值实证</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def build_config_from_sidebar() -> tuple[ExperimentConfig, bool]:
+def render_postgres_highlights(connected: bool, data_source: str) -> None:
+    """主界面 PostgreSQL 连接状态与 SQL 架构展示。"""
+    if connected:
+        st.success(
+            "⚡ 生产级 PostgreSQL 数据库连接成功！已激活 TimescaleDB/PG 混合算力引擎"
+        )
+    else:
+        st.warning(
+            f"PostgreSQL 暂不可用，已切换容灾数据源：**{data_source}**。 "
+            "请确认 `brew services start postgresql@14` 且已执行 `python db_injector.py`。"
+        )
+
+    with st.expander("🔍 查看后端核心 SQL 窗口函数架构 (Advanced SQL Code)"):
+        st.caption(
+            "以下视图在库内完成特征工程；`ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING` "
+            "严格排除当前时刻，防止未来信息泄露。"
+        )
+        st.code(SQL_CREATE_VIEW.strip(), language="sql")
+        st.caption("建模拉取语句（Web 试验舱实时查询）")
+        st.code(SQL_LOAD_PIPELINE_WIDE.strip(), language="sql")
+
+
+def load_postgresql_feature_wide(database_url: str) -> pd.DataFrame:
+    """连接 PostgreSQL，激活视图并拉取 SQL 窗口特征宽表。"""
+    engine = create_db_engine(database_url)
+    _ensure_feature_view(engine)
+    df = pd.read_sql_query(SQL_LOAD_PIPELINE_WIDE, engine)
+    if df.empty:
+        raise ValueError("v_features_pipeline_ready 视图为空，请先运行 db_injector.py 灌入数据。")
+    return df
+
+
+def load_csv_fallback_wide(data_dir: Optional[Path] = None) -> pd.DataFrame:
+    """
+    容灾：优先读取 features_ready.csv；否则走遗留多表 CSV 特征工程管线。
+    """
+    for candidate in CSV_FALLBACK_CANDIDATES:
+        if candidate.is_file():
+            raw = pd.read_csv(candidate)
+            if raw.empty:
+                continue
+            df_wide = adapt_sql_pipeline_to_model_frame(raw)
+            return _robust_fill_enhanced_env_features(df_wide)
+
+    fallback_dir = data_dir if data_dir is not None and data_dir.is_dir() else _APP_ROOT / "data"
+    tables = load_raw_tables(fallback_dir)
+    tables = enrich_market_physics_inputs(tables, schema=FeatureSchema())
+    df_wide = build_enhanced_wide_table(tables, schema=FeatureSchema())
+    df_wide = merge_frontier_physics_features(df_wide, schema=FeatureSchema())
+    df_wide = add_model_ready_features(df_wide)
+    return _robust_fill_enhanced_env_features(df_wide)
+
+
+def load_feature_wide_table_with_fallback(
+    config: ExperimentConfig,
+) -> tuple[pd.DataFrame, str, bool]:
+    """
+    优先 PostgreSQL SQL 宽表；失败则降级本地 CSV。
+
+    Returns
+    -------
+    (df_wide, source_label, postgres_connected)
+    """
+    database_url = os.getenv("MEL_DATABASE_URL", config.database_url or PRODUCTION_DATABASE_URL)
+    try:
+        df_sql = load_postgresql_feature_wide(database_url)
+        df_wide = adapt_sql_pipeline_to_model_frame(df_sql)
+        df_wide = _robust_fill_enhanced_env_features(df_wide)
+        return df_wide, "PostgreSQL · v_features_pipeline_ready", True
+    except (ConnectionError, SQLAlchemyError, ValueError, OSError) as exc:
+        st.warning(f"PostgreSQL 连接/查询失败，启动 CSV 容灾：{type(exc).__name__}: {exc}")
+        df_wide = load_csv_fallback_wide(config.data_dir)
+        label = f"CSV 容灾 · {config.data_dir or _APP_ROOT / 'data'}"
+        return df_wide, label, False
+
+
+def build_config_from_sidebar() -> tuple[ExperimentConfig, bool, bool, bool]:
     """
     从侧边栏读取用户配置。
 
@@ -156,9 +253,21 @@ def build_config_from_sidebar() -> tuple[ExperimentConfig, bool]:
     st.sidebar.header("试验控制台")
     data_mode = st.sidebar.radio(
         "数据模式",
-        options=["Demo 模拟数据", "智能数据中台 (SQLite)", "真实数据目录"],
+        options=[
+            "PostgreSQL 生产库 (推荐)",
+            "Demo 模拟数据",
+            "智能数据中台 (SQLite)",
+            "真实数据目录",
+        ],
         index=0,
-        help="Demo：内置 Mock；数据中台：读取 data_lake 历史库；真实目录：本地 CSV。",
+        help="推荐：PostgreSQL 窗口特征视图；失败自动降级 CSV。",
+    )
+    st.sidebar.text_input(
+        "PostgreSQL URL",
+        value=os.getenv("MEL_DATABASE_URL", DEFAULT_DATABASE_URL),
+        disabled=(data_mode != "PostgreSQL 生产库 (推荐)"),
+        help="可通过环境变量 MEL_DATABASE_URL 覆盖。",
+        key="pg_database_url",
     )
     pipeline_refresh = st.sidebar.checkbox(
         f"运行前先执行日更（回溯 {PIPELINE_LOOKBACK_HOURS}h / 30天）",
@@ -196,15 +305,22 @@ def build_config_from_sidebar() -> tuple[ExperimentConfig, bool]:
 
     demo = data_mode == "Demo 模拟数据"
     use_pipeline = data_mode == "智能数据中台 (SQLite)"
-    data_dir = Path(data_dir_str) if data_mode == "真实数据目录" else None
+    use_postgres = data_mode == "PostgreSQL 生产库 (推荐)"
+    data_dir = Path(data_dir_str) if data_mode in (
+        "真实数据目录",
+        "PostgreSQL 生产库 (推荐)",
+    ) else None
+    pg_url = st.session_state.get("pg_database_url", PRODUCTION_DATABASE_URL)
     config = ExperimentConfig(
         demo=demo,
+        production_db=use_postgres,
+        database_url=pg_url,
         data_dir=data_dir,
         train_ratio=train_ratio,
         storage_power_mw=power_mw,
         storage_capacity_mwh=capacity_mwh,
     )
-    return config, run_clicked, use_pipeline, pipeline_refresh
+    return config, run_clicked, use_pipeline, pipeline_refresh, use_postgres
 
 
 def load_tables_from_pipeline(
@@ -235,6 +351,7 @@ def load_tables_from_pipeline(
 def run_experiment_with_status(
     config: ExperimentConfig,
     pipeline_tables: Optional[dict] = None,
+    df_wide_preloaded: Optional[pd.DataFrame] = None,
 ) -> ExperimentReport:
     """
     分步骤执行实验 pipeline，配合 ``st.status`` 展示进度动效。
@@ -246,27 +363,39 @@ def run_experiment_with_status(
     required_cols = [COL_TARGET] + enhanced_cols
 
     with st.status("实验引擎运行中...", expanded=True) as status:
-        # --- 步骤 1：特征中台 ---
-        st.write("正在调用特征中台对齐空间辐射数据...")
-        if pipeline_tables is not None:
-            tables = pipeline_tables
+        # --- 步骤 1：特征宽表（PostgreSQL SQL / 容灾 CSV / Demo / 数据中台）---
+        if df_wide_preloaded is not None:
+            st.write("正在消费 PostgreSQL 窗口特征宽表（v_features_pipeline_ready）...")
+            df_wide = df_wide_preloaded
+        elif pipeline_tables is not None:
+            st.write("正在调用特征中台对齐空间辐射数据...")
+            tables = enrich_market_physics_inputs(pipeline_tables, schema=config.schema)
+            df_wide = build_enhanced_wide_table(tables, schema=config.schema)
+            st.write("正在计算四大前沿物理微特征（酷热/风切变/反照率/积尘）...")
+            df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
+            df_wide = add_model_ready_features(df_wide)
+            df_wide = _robust_fill_enhanced_env_features(df_wide)
         elif config.demo:
+            st.write("正在生成 Demo 模拟宽表...")
             tables = build_synthetic_raw_tables()
+            tables = enrich_market_physics_inputs(tables, schema=config.schema)
+            df_wide = build_enhanced_wide_table(tables, schema=config.schema)
+            df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
+            df_wide = add_model_ready_features(df_wide)
+            df_wide = _robust_fill_enhanced_env_features(df_wide)
         else:
             if config.data_dir is None or not config.data_dir.is_dir():
                 raise FileNotFoundError(
                     f"真实数据目录不存在: {config.data_dir}。"
-                    "请创建 data/ 并放入 market.csv 等文件，或切换 Demo / 数据中台模式。"
+                    "请创建 data/ 并放入 market.csv 等文件，或切换 PostgreSQL / Demo 模式。"
                 )
             tables = load_raw_tables(config.data_dir)
+            tables = enrich_market_physics_inputs(tables, schema=config.schema)
+            df_wide = build_enhanced_wide_table(tables, schema=config.schema)
+            df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
+            df_wide = add_model_ready_features(df_wide)
+            df_wide = _robust_fill_enhanced_env_features(df_wide)
 
-        # 补齐前沿物理原始输入（湿度/100m风/反照率/沙尘等）并二次计算四大物理特征
-        tables = enrich_market_physics_inputs(tables, schema=config.schema)
-        df_wide = build_enhanced_wide_table(tables, schema=config.schema)
-        st.write("正在计算四大前沿物理微特征（酷热/风切变/反照率/积尘）...")
-        df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
-        df_wide = add_model_ready_features(df_wide)
-        df_wide = _robust_fill_enhanced_env_features(df_wide)
         st.session_state["frontier_physics_audit"] = audit_frontier_physics_features(df_wide)
 
         missing = [c for c in required_cols if c not in df_wide.columns]
@@ -685,7 +814,28 @@ def render_charts(report: ExperimentReport) -> None:
 def main() -> None:
     """应用入口。"""
     render_banner()
-    config, run_clicked, use_pipeline, pipeline_refresh = build_config_from_sidebar()
+    config, run_clicked, use_pipeline, pipeline_refresh, use_postgres = (
+        build_config_from_sidebar()
+    )
+
+    # PostgreSQL 连接探测（侧边栏展示，不阻塞页面）
+    pg_connected = False
+    data_source = "未加载"
+    if use_postgres and not config.demo:
+        try:
+            database_url = os.getenv(
+                "MEL_DATABASE_URL",
+                config.database_url or PRODUCTION_DATABASE_URL,
+            )
+            create_db_engine(database_url)
+            pg_connected = True
+            data_source = "PostgreSQL（待命）"
+        except (ConnectionError, SQLAlchemyError, OSError):
+            pg_connected = False
+            data_source = "PostgreSQL 离线 · 将使用 CSV 容灾"
+
+    if use_postgres:
+        render_postgres_highlights(pg_connected, data_source)
 
     # 主区也放置醒目运行按钮（与侧边栏联动）
     col_btn, col_info = st.columns([1, 3])
@@ -698,6 +848,8 @@ def main() -> None:
     with col_info:
         if config.demo:
             mode_label = "Demo 模拟"
+        elif use_postgres:
+            mode_label = f"PostgreSQL 生产库 · {config.database_url}"
         elif use_pipeline:
             mode_label = "智能数据中台 · data_lake/mel_env_history.db"
         else:
@@ -722,25 +874,39 @@ def main() -> None:
         st.markdown(
             """
             #### 使用指南
-            1. 在左侧选择 **Demo 模拟数据**（默认，无需准备 CSV）或指定真实数据目录。  
-            2. 调整 **时序划分比例**（默认 80% 训练 / 20% 测试）。  
-            3. 点击 **启动双模型打擂台**，查看实证报告与 Plotly 图表。  
+            1. 默认 **PostgreSQL 生产库**：库内窗口函数实时产出特征宽表（失败自动 CSV 容灾）。  
+            2. 亦可切换 **Demo 模拟** / **SQLite 数据中台** / **真实 CSV 目录**。  
+            3. 调整 **时序划分比例**（默认 80% 训练 / 20% 测试）后点击 **启动双模型打擂台**。  
             """
         )
         return
 
     try:
         pipeline_tables = None
+        df_wide_preloaded: Optional[pd.DataFrame] = None
+        pg_run_connected = False
+
+        if use_postgres and not config.demo:
+            with st.spinner("正在从 PostgreSQL 拉取 v_features_pipeline_ready 窗口特征宽表..."):
+                df_wide_preloaded, src_label, pg_run_connected = (
+                    load_feature_wide_table_with_fallback(config)
+                )
+                st.session_state["data_source"] = src_label
+                render_postgres_highlights(pg_run_connected, src_label)
+
         if use_pipeline:
             with st.spinner(
                 f"正在执行 {PIPELINE_LOOKBACK_HOURS}h（30天）数据中台日更并加载样本..."
             ):
-                # 打擂台前显式 720h 回溯，与命令行 --lookback-hours 720 对齐
                 pipeline_tables = load_tables_from_pipeline(
                     run_update=pipeline_refresh,
                     lookback_hours=PIPELINE_LOOKBACK_HOURS,
                 )
-        report = run_experiment_with_status(config, pipeline_tables=pipeline_tables)
+        report = run_experiment_with_status(
+            config,
+            pipeline_tables=pipeline_tables,
+            df_wide_preloaded=df_wide_preloaded,
+        )
     except Exception as exc:
         st.error(f"实验失败：{type(exc).__name__}: {exc}")
         st.exception(exc)

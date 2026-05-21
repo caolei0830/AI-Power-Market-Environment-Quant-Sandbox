@@ -12,12 +12,14 @@
 用法
 ----
     python run_experiment.py --demo
-    python run_experiment.py --data-dir ./data
+    python run_experiment.py --production-db
+    python run_experiment.py --data-dir ./data   # 遗留 CSV 多表管线
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import warnings
 from dataclasses import dataclass, field
@@ -34,6 +36,9 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from db_feature_view import SQL_CREATE_VIEW  # noqa: E402
+from db_injector import DEFAULT_DATABASE_URL, create_db_engine  # noqa: E402
+from sqlalchemy import text  # noqa: E402
 from environmental_feature_engineer import (  # noqa: E402
     FeatureSchema,
     align_and_merge_all,
@@ -42,6 +47,19 @@ from environmental_feature_engineer import (  # noqa: E402
     process_pollution_interaction,
     process_radiation_features,
 )
+
+# ---------------------------------------------------------------------------
+# 生产 PostgreSQL 特征源（v_features_pipeline_ready 窗口函数宽表）
+# ---------------------------------------------------------------------------
+PRODUCTION_DATABASE_URL = os.getenv("MEL_DATABASE_URL", DEFAULT_DATABASE_URL)
+DEFAULT_PRODUCTION_NODE_ID = "PJM_HUB"
+
+SQL_LOAD_FEATURES_PIPELINE = """
+SELECT *
+FROM v_features_pipeline_ready
+WHERE node_id = 'PJM_HUB'
+ORDER BY timestamp ASC
+"""
 
 # ---------------------------------------------------------------------------
 # 列名常量（与 FeatureSchema 默认一致，可按主项目覆盖）
@@ -121,6 +139,9 @@ class ExperimentConfig:
     train_ratio: float = 0.80
     data_dir: Optional[Path] = None
     demo: bool = False
+    production_db: bool = False
+    database_url: str = field(default_factory=lambda: PRODUCTION_DATABASE_URL)
+    node_id: str = DEFAULT_PRODUCTION_NODE_ID
     schema: FeatureSchema = field(default_factory=FeatureSchema)
     storage_power_mw: float = STORAGE_POWER_MW
     storage_capacity_mwh: float = STORAGE_CAPACITY_MWH
@@ -156,6 +177,39 @@ class ExperimentReport:
 # ---------------------------------------------------------------------------
 # 依赖导入（带友好报错）
 # ---------------------------------------------------------------------------
+class _SklearnLGBMShim:
+    """LightGBM 不可用（缺 libomp 等）时，用 sklearn 分位数 GBR 保持 API 兼容。"""
+
+    class LGBMRegressor:
+        def __init__(self, **kwargs: Any) -> None:
+            from sklearn.ensemble import GradientBoostingRegressor
+
+            self._model = GradientBoostingRegressor(
+                loss="quantile",
+                alpha=float(kwargs.get("alpha", 0.5)),
+                n_estimators=int(kwargs.get("n_estimators", 200)),
+                learning_rate=float(kwargs.get("learning_rate", 0.05)),
+                max_depth=int(kwargs.get("max_depth", 8)),
+                subsample=float(kwargs.get("subsample", 0.85)),
+                random_state=int(kwargs.get("random_state", 42)),
+            )
+
+        def fit(self, X: pd.DataFrame, y: pd.Series, **kwargs: Any) -> "_SklearnLGBMShim.LGBMRegressor":
+            self._model.fit(X, y)
+            return self
+
+        def predict(self, X: pd.DataFrame) -> np.ndarray:
+            return np.asarray(self._model.predict(X), dtype=float)
+
+        @property
+        def feature_importances_(self) -> np.ndarray:
+            return np.asarray(self._model.feature_importances_, dtype=float)
+
+    @staticmethod
+    def early_stopping(stopping_rounds: int = 30, verbose: bool = False) -> None:
+        return None
+
+
 def _import_lightgbm() -> Any:
     try:
         import lightgbm as lgb  # type: ignore
@@ -165,6 +219,15 @@ def _import_lightgbm() -> Any:
         raise ImportError(
             "未安装 lightgbm。请执行: pip install lightgbm"
         ) from exc
+    except OSError as exc:
+        warnings.warn(
+            f"LightGBM 动态库加载失败（常见于 macOS 缺 libomp）: {exc}\n"
+            "已自动回退 sklearn GradientBoostingRegressor（quantile）。"
+            "修复原生 LightGBM: brew install libomp",
+            UserWarning,
+            stacklevel=2,
+        )
+        return _SklearnLGBMShim()
 
 
 def _import_optimizer() -> tuple[str, Any, Callable[[float, float, float], float]]:
@@ -263,6 +326,103 @@ def _fallback_optimize_storage_point(
 # ---------------------------------------------------------------------------
 # 数据加载与特征衍生（防泄露：目标列不进入滞后以外的 contemporaneous 特征）
 # ---------------------------------------------------------------------------
+def _ensure_feature_view(engine: Any) -> None:
+    """确保 PostgreSQL 特征视图已激活（幂等 CREATE OR REPLACE VIEW）。"""
+    with engine.begin() as conn:
+        conn.execute(text(SQL_CREATE_VIEW))
+
+
+def load_features_from_production_db(
+    database_url: str = PRODUCTION_DATABASE_URL,
+    node_id: str = DEFAULT_PRODUCTION_NODE_ID,
+) -> pd.DataFrame:
+    """
+    从 ``v_features_pipeline_ready`` 读取 SQL 窗口特征宽表。
+
+    默认执行标准查询（PJM_HUB 节点、时间升序），由库内 LAG / 移动平均完成特征工程。
+    """
+    engine = create_db_engine(database_url)
+    _ensure_feature_view(engine)
+
+    if node_id == DEFAULT_PRODUCTION_NODE_ID:
+        sql = SQL_LOAD_FEATURES_PIPELINE
+        df = pd.read_sql_query(sql, engine)
+    else:
+        sql = text(
+            """
+            SELECT *
+            FROM v_features_pipeline_ready
+            WHERE node_id = :node_id
+            ORDER BY timestamp ASC
+            """
+        )
+        with engine.connect() as conn:
+            df = pd.read_sql_query(sql, conn, params={"node_id": node_id})
+
+    if df.empty:
+        raise ValueError(
+            f"节点 {node_id!r} 在 v_features_pipeline_ready 中无数据。"
+            "请确认 db_injector 已灌入该节点。"
+        )
+    return df
+
+
+def adapt_sql_pipeline_to_model_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将 SQL 视图列映射为 LightGBM 擂台所需宽表列名。
+
+    - ``price_rt`` → ``spot_price``（结算/训练标签）
+    - ``system_load`` → ``total_load``
+    - ``price_rt_lag_1h`` → ``spot_price_lag_1h``（库内窗口函数，无泄露）
+    - 缺失的基准气象/新能源代理列以 0 占位，增强环境列由后续鲁棒填充
+    """
+    out = df.copy()
+    out[COL_TIMESTAMP] = pd.to_datetime(out[COL_TIMESTAMP], errors="coerce")
+    out = out.dropna(subset=[COL_TIMESTAMP]).sort_values(COL_TIMESTAMP).reset_index(drop=True)
+
+    if COL_TARGET not in out.columns:
+        if "price_rt" in out.columns:
+            out[COL_TARGET] = pd.to_numeric(out["price_rt"], errors="coerce")
+        elif "price_da" in out.columns:
+            out[COL_TARGET] = pd.to_numeric(out["price_da"], errors="coerce")
+        else:
+            raise ValueError("SQL 宽表缺少 price_rt / price_da，无法构造 spot_price 标签。")
+
+    if "total_load" not in out.columns and "system_load" in out.columns:
+        out["total_load"] = pd.to_numeric(out["system_load"], errors="coerce")
+
+    if "spot_price_lag_1h" not in out.columns and "price_rt_lag_1h" in out.columns:
+        out["spot_price_lag_1h"] = pd.to_numeric(out["price_rt_lag_1h"], errors="coerce")
+
+    if "spot_price_lag_24h" not in out.columns:
+        out["spot_price_lag_24h"] = out[COL_TARGET].shift(24)
+
+    for col in ("wind_forecast", "solar_forecast", "temperature", "wind_speed"):
+        if col not in out.columns:
+            out[col] = 0.0
+
+    return out
+
+
+def build_wide_table_from_production_db(config: ExperimentConfig) -> pd.DataFrame:
+    """生产库 SQL 宽表 → 建模就绪 DataFrame（跳过 CSV 多表特征工程）。"""
+    df_sql = load_features_from_production_db(config.database_url, config.node_id)
+    df_wide = adapt_sql_pipeline_to_model_frame(df_sql)
+    return _robust_fill_enhanced_env_features(df_wide)
+
+
+def build_wide_table_from_csv_pipeline(config: ExperimentConfig) -> pd.DataFrame:
+    """遗留 CSV 多表 → 特征工程宽表（原管线）。"""
+    if config.data_dir is None:
+        raise ValueError("CSV 模式必须指定 --data-dir。")
+    tables = load_raw_tables(config.data_dir)
+    tables = enrich_market_physics_inputs(tables, schema=config.schema)
+    df_wide = build_enhanced_wide_table(tables, schema=config.schema)
+    df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
+    df_wide = add_model_ready_features(df_wide)
+    return _robust_fill_enhanced_env_features(df_wide)
+
+
 def _read_csv_if_exists(path: Path) -> Optional[pd.DataFrame]:
     if path.is_file():
         return pd.read_csv(path)
@@ -459,11 +619,15 @@ def add_model_ready_features(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"宽表必须包含目标列 '{COL_TARGET}'。")
 
     for lag in _PRICE_LAG_HOURS:
-        out[f"spot_price_lag_{lag}h"] = out[COL_TARGET].shift(lag)
+        col = f"spot_price_lag_{lag}h"
+        if col not in out.columns:
+            out[col] = out[COL_TARGET].shift(lag)
 
     if "water_temp" in out.columns:
         for lag in _WATER_LAG_HOURS:
-            out[f"water_temp_lag_{lag}h"] = out["water_temp"].shift(lag)
+            col = f"water_temp_lag_{lag}h"
+            if col not in out.columns:
+                out[col] = out["water_temp"].shift(lag)
 
     return out
 
@@ -534,7 +698,12 @@ def train_quantile_lgbm(
     model = lgb.LGBMRegressor(**LGBM_PARAMS)
 
     fit_kwargs: dict[str, Any] = {}
-    if X_valid is not None and y_valid is not None and len(X_valid) > 0:
+    if (
+        X_valid is not None
+        and y_valid is not None
+        and len(X_valid) > 0
+        and hasattr(lgb, "early_stopping")
+    ):
         fit_kwargs["eval_set"] = [(X_valid, y_valid)]
         fit_kwargs["callbacks"] = [lgb.early_stopping(stopping_rounds=30, verbose=False)]
 
@@ -691,19 +860,18 @@ def print_experiment_report(report: ExperimentReport) -> None:
 
 def run_experiment(config: ExperimentConfig) -> ExperimentReport:
     """执行完整对比实验。"""
-    # ---------- 1. 加载原始表 & 特征工程宽表 ----------
+    # ---------- 1. 加载特征宽表 ----------
     if config.demo:
         tables = build_synthetic_raw_tables()
+        tables = enrich_market_physics_inputs(tables, schema=config.schema)
+        df_wide = build_enhanced_wide_table(tables, schema=config.schema)
+        df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
+        df_wide = add_model_ready_features(df_wide)
+        df_wide = _robust_fill_enhanced_env_features(df_wide)
+    elif config.production_db or config.data_dir is None:
+        df_wide = build_wide_table_from_production_db(config)
     else:
-        if config.data_dir is None:
-            raise ValueError("非 demo 模式必须指定 --data-dir。")
-        tables = load_raw_tables(config.data_dir)
-
-    tables = enrich_market_physics_inputs(tables, schema=config.schema)
-    df_wide = build_enhanced_wide_table(tables, schema=config.schema)
-    df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
-    df_wide = add_model_ready_features(df_wide)
-    df_wide = _robust_fill_enhanced_env_features(df_wide)
+        df_wide = build_wide_table_from_csv_pipeline(config)
 
     benchmark_cols = list(BENCHMARK_FEATURE_COLUMNS)
     enhanced_cols = benchmark_cols + list(ENHANCED_ENV_COLUMNS)
@@ -809,10 +977,27 @@ def parse_args() -> ExperimentConfig:
         help="使用合成数据跑通闭环（无需 CSV）",
     )
     parser.add_argument(
+        "--production-db",
+        action="store_true",
+        help="从 data/production_market.db 的 v_features_pipeline_ready 加载（SQL 窗口特征）",
+    )
+    parser.add_argument(
+        "--database-url",
+        type=str,
+        default=PRODUCTION_DATABASE_URL,
+        help="PostgreSQL 连接 URL（默认 postgresql://localhost:5432/postgres）",
+    )
+    parser.add_argument(
+        "--node-id",
+        type=str,
+        default=DEFAULT_PRODUCTION_NODE_ID,
+        help="SQL 过滤节点（默认 PJM_HUB；标准查询已写死该值）",
+    )
+    parser.add_argument(
         "--data-dir",
         type=str,
         default=None,
-        help="存放 market.csv / era5.csv / ... 的目录",
+        help="遗留模式：从 CSV 多表跑特征工程（与 --production-db 互斥）",
     )
     parser.add_argument(
         "--train-ratio",
@@ -835,6 +1020,9 @@ def parse_args() -> ExperimentConfig:
     args = parser.parse_args()
     return ExperimentConfig(
         demo=args.demo,
+        production_db=args.production_db,
+        database_url=args.database_url,
+        node_id=args.node_id,
         data_dir=Path(args.data_dir) if args.data_dir else None,
         train_ratio=args.train_ratio,
         storage_power_mw=args.storage_power_mw,
@@ -844,9 +1032,17 @@ def parse_args() -> ExperimentConfig:
 
 def main() -> None:
     config = parse_args()
-    if not config.demo and config.data_dir is None:
-        print("未指定 --data-dir，将使用 --demo 合成数据模式。")
-        config = ExperimentConfig(demo=True, train_ratio=config.train_ratio)
+    if not config.demo and not config.production_db and config.data_dir is None:
+        print("未指定 --data-dir / --demo，默认使用 PostgreSQL 生产库模式。")
+        config = ExperimentConfig(
+            demo=False,
+            production_db=True,
+            database_url=config.database_url,
+            node_id=config.node_id,
+            train_ratio=config.train_ratio,
+            storage_power_mw=config.storage_power_mw,
+            storage_capacity_mwh=config.storage_capacity_mwh,
+        )
 
     try:
         report = run_experiment(config)
