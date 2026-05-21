@@ -1,0 +1,8 @@
+﻿track_name,track_id,model_family,n_train,n_test,rmse,mae,r2,storage_revenue_cny,profitable_hour_ratio,alpha_vs_idle_pct,data_source,notes
+A_baseline,A,lightgbm,1209,303,23.488050713900027,17.48061857191615,0.6227504168108555,47349.58659754758,,,postgresql,Baseline Market Only
+B_full_env,B,lightgbm,1209,303,20.60472207705525,15.066574011524278,0.7096857599288255,53082.40922677151,,,postgresql,Full Environmental Micro-Features
+C1_radiation_only,C1,lightgbm,1209,303,21.414489315451064,15.79385687354363,0.6864186245799502,56315.92818493164,,,postgresql,Ablation — Radiation Only
+C2_pollution_only,C2,lightgbm,1209,303,23.488050713900027,17.48061857191615,0.6227504168108555,47349.58659754758,,,postgresql,Ablation — Pollution Only
+C3_sst_only,C3,lightgbm,1209,303,23.488050713900027,17.48061857191615,0.6227504168108555,47349.58659754758,,,postgresql,Ablation — Sea-Surface Temperature Lags Only
+D_robustness_noise,D,lightgbm,1209,303,20.795299009007326,15.216842678653547,0.7042905827680559,52948.235528918034,,,postgresql,Robustness — Markov Feature Noise
+E_ppo_drl,E,pytorch_ppo,1209,303,,,,773408.3016108986,1.0,100.0,postgresql,Deep RL — PyTorch PPO VPP Control

@@ -12,3 +12,4 @@ requests>=2.31
 pyarrow>=14.0
 gymnasium>=0.29
 torch>=2.0
+pyyaml>=6.0
