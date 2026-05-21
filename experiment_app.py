@@ -9,23 +9,27 @@ experiment_app.py — 环境微特征电力现货预测增强试验舱（Streaml
 
 说明
 ----
-- 默认连接 PostgreSQL 生产库，从 ``v_features_pipeline_ready`` 读取 SQL 窗口特征宽表。
-- 数据库不可用时自动降级本地 CSV 容灾备份。
-- 实验核心逻辑复用 ``run_experiment.py``，本文件负责交互与可视化。
+- **三级容灾抽水**：PostgreSQL 生产库 → 云端内存 SQLite 沙盒 → Mock 自愈灌库。
+- 任意层级均自动激活 ``v_features_pipeline_ready`` 窗口函数视图（LAG / AVG OVER）。
+- 适配 Streamlit Cloud（无本地 PG、无 git 数据文件）零配置演示。
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.pool import StaticPool
 
 # 保证可导入同目录下的实验脚本
 _APP_ROOT = Path(__file__).resolve().parent
@@ -73,17 +77,99 @@ from environmental_feature_engineer import (  # noqa: E402
 # 工业级默认回溯窗口：30 天 × 24h，保证 LightGBM 有足够样本学习环境长尾微特征
 PIPELINE_LOOKBACK_HOURS: int = 720
 
-# PostgreSQL 生产库：由库内窗口函数实时产出特征宽表（全节点、时间升序）
+# 建模拉取：库内窗口函数实时产出特征宽表（全节点、时间升序）
 SQL_LOAD_PIPELINE_WIDE = """
 SELECT *
 FROM v_features_pipeline_ready
 ORDER BY timestamp ASC
 """
 
+SQL_PREVIEW_SAMPLE = """
+SELECT *
+FROM v_features_pipeline_ready
+ORDER BY RANDOM()
+LIMIT 5
+"""
+
+# SQLite 内存沙盒 DDL（与 PostgreSQL 语义对齐，供 Streamlit Cloud 容灾）
+DDL_SQLITE_MARKET_NODES = """
+CREATE TABLE IF NOT EXISTS market_nodes (
+    node_id    TEXT PRIMARY KEY,
+    rto_name   TEXT NOT NULL,
+    zone_name  TEXT NOT NULL,
+    node_type  TEXT NOT NULL
+);
+"""
+
+DDL_SQLITE_RTO_METRICS = """
+CREATE TABLE IF NOT EXISTS rto_hourly_metrics (
+    timestamp                  TEXT NOT NULL,
+    node_id                    TEXT NOT NULL,
+    price_da                   REAL,
+    price_rt                   REAL,
+    system_load                REAL,
+    heat_index                 REAL,
+    wind_shear_alpha           REAL,
+    bifacial_gain_index        REAL,
+    panel_efficiency_discount  REAL,
+    PRIMARY KEY (timestamp, node_id),
+    FOREIGN KEY (node_id) REFERENCES market_nodes (node_id)
+);
+"""
+
+# 窗口视图（SQLite 用 DROP + CREATE；PostgreSQL 用 OR REPLACE，见激活函数）
+SQL_CREATE_VIEW_SQLITE = """
+CREATE VIEW v_features_pipeline_ready AS
+SELECT
+    m.timestamp,
+    m.node_id,
+    n.rto_name,
+    n.zone_name,
+    n.node_type,
+    m.price_da,
+    m.price_rt,
+    m.system_load,
+    m.heat_index,
+    m.wind_shear_alpha,
+    m.bifacial_gain_index,
+    m.panel_efficiency_discount,
+    (m.price_da - m.price_rt) AS basis_spread,
+    LAG(m.price_rt, 1) OVER (
+        PARTITION BY m.node_id
+        ORDER BY m.timestamp
+    ) AS price_rt_lag_1h,
+    AVG(m.price_rt) OVER (
+        PARTITION BY m.node_id
+        ORDER BY m.timestamp
+        ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING
+    ) AS price_rt_ma_24h
+FROM rto_hourly_metrics AS m
+LEFT JOIN market_nodes AS n
+    ON n.node_id = m.node_id;
+"""
+
 CSV_FALLBACK_CANDIDATES: tuple[Path, ...] = (
     _APP_ROOT / "data" / "features_ready.csv",
     _APP_ROOT / "data" / "feature_ready.csv",
 )
+
+MOCK_SEED_HOURS = 120
+DEFAULT_MOCK_NODE = "PJM_HUB"
+SESSION_ENGINE_KEY = "mel_feature_engine"
+SESSION_TIER_KEY = "mel_data_tier"
+
+
+@dataclass
+class DataSourcingContext:
+    """三级容灾抽水结果上下文。"""
+
+    tier: Literal[1, 2, 3]
+    tier_label: str
+    banner_message: str
+    postgres_connected: bool
+    engine: Optional[Engine]
+    sql_preview: pd.DataFrame
+    database_url: str
 
 # ---------------------------------------------------------------------------
 # 页面基础配置
@@ -166,80 +252,325 @@ def render_banner() -> None:
     )
 
 
-def render_postgres_highlights(connected: bool, data_source: str) -> None:
-    """主界面 PostgreSQL 连接状态与 SQL 架构展示。"""
-    if connected:
-        st.success(
-            "⚡ 生产级 PostgreSQL 数据库连接成功！已激活 TimescaleDB/PG 混合算力引擎"
-        )
+def render_data_tier_banner(ctx: DataSourcingContext) -> None:
+    """主界面：按容灾层级展示状态 + SQL 架构 + 抽样数据。"""
+    if ctx.tier == 1:
+        st.success(ctx.banner_message)
+    elif ctx.tier == 2:
+        st.info(ctx.banner_message)
     else:
-        st.warning(
-            f"PostgreSQL 暂不可用，已切换容灾数据源：**{data_source}**。 "
-            "请确认 `brew services start postgresql@14` 且已执行 `python db_injector.py`。"
-        )
+        st.warning(ctx.banner_message)
+
+    st.caption(f"数据管线：**{ctx.tier_label}** · Engine=`{ctx.engine.dialect.name if ctx.engine else 'n/a'}`")
 
     with st.expander("🔍 查看后端核心 SQL 窗口函数架构 (Advanced SQL Code)"):
         st.caption(
-            "以下视图在库内完成特征工程；`ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING` "
-            "严格排除当前时刻，防止未来信息泄露。"
+            "视图在库内完成特征工程；`ROWS BETWEEN 24 PRECEDING AND 1 PRECEDING` "
+            "严格排除当前行，防止未来信息泄露（No Look-ahead）。"
         )
         st.code(SQL_CREATE_VIEW.strip(), language="sql")
         st.caption("建模拉取语句（Web 试验舱实时查询）")
         st.code(SQL_LOAD_PIPELINE_WIDE.strip(), language="sql")
+        st.caption("随机抽样预览（面试官可见窗口函数已生效）")
+        if ctx.sql_preview is not None and not ctx.sql_preview.empty:
+            st.dataframe(ctx.sql_preview, use_container_width=True, hide_index=True)
+        else:
+            st.info("预览数据为空，请点击「启动双模型打擂台」触发自愈灌库。")
 
 
-def load_postgresql_feature_wide(database_url: str) -> pd.DataFrame:
-    """连接 PostgreSQL，激活视图并拉取 SQL 窗口特征宽表。"""
-    engine = create_db_engine(database_url)
-    _ensure_feature_view(engine)
+def create_memory_sqlite_engine() -> Engine:
+    """第二级：云端内存 SQLite 沙盒（StaticPool 保持 :memory: 库不销毁）。"""
+    return create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+
+def activate_feature_view_on_engine(engine: Engine) -> None:
+    """在 PostgreSQL 或 SQLite 上幂等激活窗口特征视图。"""
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        if dialect == "postgresql":
+            conn.execute(text(SQL_CREATE_VIEW))
+        else:
+            conn.execute(text("DROP VIEW IF EXISTS v_features_pipeline_ready"))
+            conn.execute(text(DDL_SQLITE_MARKET_NODES))
+            conn.execute(text(DDL_SQLITE_RTO_METRICS))
+            conn.execute(text(SQL_CREATE_VIEW_SQLITE))
+
+
+def _count_metrics_rows(engine: Engine) -> int:
+    with engine.connect() as conn:
+        try:
+            val = conn.execute(text("SELECT COUNT(*) FROM rto_hourly_metrics")).scalar()
+            return int(val or 0)
+        except OperationalError:
+            return 0
+
+
+def generate_mock_seed_tables(n_hours: int = MOCK_SEED_HOURS) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """第三级：动态 Mock 120h 仿真时序 + 四大物理因子。"""
+    hours = pd.date_range("2024-01-01", periods=n_hours, freq="h", tz="UTC")
+    rng = np.random.default_rng(42)
+    t = np.arange(n_hours, dtype=float)
+
+    price_da = 300.0 + 50.0 * np.sin(t / 24.0) + rng.normal(0, 5.0, n_hours)
+    price_rt = price_da + rng.normal(0, 1.5, n_hours)
+    system_load = 11000.0 + 500.0 * np.sin(t / 24.0) + rng.normal(0, 80.0, n_hours)
+
+    nodes = pd.DataFrame(
+        [
+            {
+                "node_id": DEFAULT_MOCK_NODE,
+                "rto_name": "PJM",
+                "zone_name": "HUB_ZONE",
+                "node_type": "HUB",
+            }
+        ]
+    )
+    facts = pd.DataFrame(
+        {
+            "timestamp": hours.strftime("%Y-%m-%d %H:%M:%S"),
+            "node_id": DEFAULT_MOCK_NODE,
+            "price_da": price_da,
+            "price_rt": price_rt,
+            "system_load": system_load,
+            "heat_index": 25.0 + rng.normal(0, 1.0, n_hours),
+            "wind_shear_alpha": np.clip(0.15 + rng.normal(0, 0.02, n_hours), 0.05, 0.35),
+            "bifacial_gain_index": 1.0 + rng.normal(0, 0.05, n_hours),
+            "panel_efficiency_discount": np.clip(
+                0.02 + np.cumsum(rng.normal(0, 0.001, n_hours)), 0.0, 0.15
+            ),
+        }
+    )
+    return nodes, facts
+
+
+def _hydrate_sqlite_from_csv(engine: Engine, data_dir: Optional[Path]) -> bool:
+    """尝试将本地 CSV 注入内存库（Streamlit Cloud 通常无文件，静默跳过）。"""
+    candidates = list(CSV_FALLBACK_CANDIDATES)
+    if data_dir is not None:
+        candidates.insert(0, data_dir / "features_ready.csv")
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            raw = pd.read_csv(path)
+            if raw.empty or "timestamp" not in raw.columns:
+                continue
+            ts = pd.to_datetime(raw["timestamp"], utc=True, errors="coerce")
+            price_col = raw["price_da"] if "price_da" in raw.columns else raw.get("spot_price")
+            rt_col = raw["price_rt"] if "price_rt" in raw.columns else price_col
+            node_series = (
+                raw["node_id"].astype(str)
+                if "node_id" in raw.columns
+                else pd.Series([DEFAULT_MOCK_NODE] * len(raw))
+            )
+            facts = pd.DataFrame(
+                {
+                    "timestamp": ts.dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "node_id": node_series,
+                    "price_da": pd.to_numeric(price_col, errors="coerce"),
+                    "price_rt": pd.to_numeric(rt_col, errors="coerce"),
+                    "system_load": pd.to_numeric(
+                        raw.get("system_load", raw.get("total_load", 0)), errors="coerce"
+                    ),
+                    "heat_index": pd.to_numeric(raw.get("heat_index", 0), errors="coerce"),
+                    "wind_shear_alpha": pd.to_numeric(
+                        raw.get("wind_shear_alpha", raw.get("wind_shear_coefficient", 0)),
+                        errors="coerce",
+                    ),
+                    "bifacial_gain_index": pd.to_numeric(
+                        raw.get("bifacial_gain_index", 0), errors="coerce"
+                    ),
+                    "panel_efficiency_discount": pd.to_numeric(
+                        raw.get("panel_efficiency_discount", 0), errors="coerce"
+                    ),
+                }
+            ).dropna(subset=["timestamp"])
+            if facts.empty:
+                continue
+            node_id = str(facts["node_id"].iloc[0])[:20]
+            rto_name = str(raw["rto_name"].iloc[0]) if "rto_name" in raw.columns else "PJM"
+            nodes = pd.DataFrame(
+                [
+                    {
+                        "node_id": node_id,
+                        "rto_name": rto_name,
+                        "zone_name": "HUB_ZONE",
+                        "node_type": "HUB",
+                    }
+                ]
+            )
+            with engine.begin() as conn:
+                conn.execute(text(DDL_SQLITE_MARKET_NODES))
+                conn.execute(text(DDL_SQLITE_RTO_METRICS))
+            nodes.to_sql("market_nodes", engine, if_exists="append", index=False)
+            facts.to_sql("rto_hourly_metrics", engine, if_exists="append", index=False, method="multi")
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def bootstrap_memory_sqlite_database(
+    engine: Engine,
+    data_dir: Optional[Path] = None,
+) -> Literal[2, 3]:
+    """
+    初始化内存库：建表 → CSV 注水（若有）→ Mock 自愈（若无数据）。
+    返回实际启用的子层级 2（CSV）或 3（Mock）。
+    """
+    with engine.begin() as conn:
+        conn.execute(text(DDL_SQLITE_MARKET_NODES))
+        conn.execute(text(DDL_SQLITE_RTO_METRICS))
+
+    if _count_metrics_rows(engine) == 0:
+        if _hydrate_sqlite_from_csv(engine, data_dir):
+            tier_sub: Literal[2, 3] = 2
+        else:
+            nodes, facts = generate_mock_seed_tables()
+            nodes.to_sql("market_nodes", engine, if_exists="append", index=False)
+            facts.to_sql(
+                "rto_hourly_metrics",
+                engine,
+                if_exists="append",
+                index=False,
+                method="multi",
+                chunksize=5000,
+            )
+            tier_sub = 3
+    else:
+        tier_sub = 2
+
+    activate_feature_view_on_engine(engine)
+    return tier_sub
+
+
+def fetch_sql_pipeline_wide(engine: Engine) -> pd.DataFrame:
+    """从已激活视图的引擎拉取特征宽表。"""
     df = pd.read_sql_query(SQL_LOAD_PIPELINE_WIDE, engine)
     if df.empty:
-        raise ValueError("v_features_pipeline_ready 视图为空，请先运行 db_injector.py 灌入数据。")
+        raise ValueError("v_features_pipeline_ready 查询结果为空。")
     return df
 
 
-def load_csv_fallback_wide(data_dir: Optional[Path] = None) -> pd.DataFrame:
-    """
-    容灾：优先读取 features_ready.csv；否则走遗留多表 CSV 特征工程管线。
-    """
-    for candidate in CSV_FALLBACK_CANDIDATES:
-        if candidate.is_file():
-            raw = pd.read_csv(candidate)
-            if raw.empty:
-                continue
-            df_wide = adapt_sql_pipeline_to_model_frame(raw)
-            return _robust_fill_enhanced_env_features(df_wide)
+def fetch_sql_preview_sample(engine: Engine) -> pd.DataFrame:
+    try:
+        return pd.read_sql_query(SQL_PREVIEW_SAMPLE, engine)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
 
-    fallback_dir = data_dir if data_dir is not None and data_dir.is_dir() else _APP_ROOT / "data"
-    tables = load_raw_tables(fallback_dir)
-    tables = enrich_market_physics_inputs(tables, schema=FeatureSchema())
-    df_wide = build_enhanced_wide_table(tables, schema=FeatureSchema())
-    df_wide = merge_frontier_physics_features(df_wide, schema=FeatureSchema())
-    df_wide = add_model_ready_features(df_wide)
-    return _robust_fill_enhanced_env_features(df_wide)
+
+def try_tier1_postgresql(database_url: str) -> Optional[DataSourcingContext]:
+    """第一级：真实 PostgreSQL 生产环境。"""
+    try:
+        engine = create_db_engine(database_url)
+        _ensure_feature_view(engine)
+        df_sql = fetch_sql_pipeline_wide(engine)
+        preview = fetch_sql_preview_sample(engine)
+        return DataSourcingContext(
+            tier=1,
+            tier_label="Tier-1 · PostgreSQL 生产库",
+            banner_message=(
+                "⚡ 生产级 PostgreSQL 数据库连接成功！已激活 TimescaleDB/PG 混合算力引擎"
+            ),
+            postgres_connected=True,
+            engine=engine,
+            sql_preview=preview,
+            database_url=database_url,
+        )
+    except OperationalError:
+        return None
+    except (ConnectionError, SQLAlchemyError, OSError, ValueError):
+        return None
+
+
+def build_tier2_or_tier3_context(
+    database_url: str,
+    data_dir: Optional[Path] = None,
+    engine: Optional[Engine] = None,
+) -> DataSourcingContext:
+    """第二级内存 SQLite；必要时第三级 Mock 自愈。"""
+    mem_engine = engine or create_memory_sqlite_engine()
+    sub_tier = bootstrap_memory_sqlite_database(mem_engine, data_dir=data_dir)
+    preview = fetch_sql_preview_sample(mem_engine)
+
+    if sub_tier == 3:
+        return DataSourcingContext(
+            tier=3,
+            tier_label="Tier-3 · 内存沙盒 + Mock 自愈灌库",
+            banner_message=(
+                "🛡️ Streamlit Cloud 容灾：已启用内存 SQLite 沙盒，并动态 Mock 120 行仿真时序 "
+                "（含四大物理因子 + 窗口函数视图）。"
+            ),
+            postgres_connected=False,
+            engine=mem_engine,
+            sql_preview=preview,
+            database_url=database_url,
+        )
+    return DataSourcingContext(
+        tier=2,
+        tier_label="Tier-2 · 云端内存 SQLite 沙盒",
+        banner_message=(
+            "☁️ PostgreSQL 不可用（云端环境）：已降级至内存 SQLite 高仿真沙盒，"
+            "SQL 窗口视图已激活。"
+        ),
+        postgres_connected=False,
+        engine=mem_engine,
+        sql_preview=preview,
+        database_url=database_url,
+    )
+
+
+def resolve_three_tier_data_sourcing(
+    config: ExperimentConfig,
+    *,
+    reuse_session: bool = True,
+) -> DataSourcingContext:
+    """
+    智能三级降级抽水：PG → 内存 SQLite → Mock 自愈。
+    """
+    database_url = os.getenv("MEL_DATABASE_URL", config.database_url or PRODUCTION_DATABASE_URL)
+
+    if reuse_session and SESSION_TIER_KEY in st.session_state:
+        cached: DataSourcingContext = st.session_state[SESSION_TIER_KEY]
+        if cached.engine is not None:
+            try:
+                cached.sql_preview = fetch_sql_preview_sample(cached.engine)
+            except Exception:  # noqa: BLE001
+                pass
+            return cached
+
+    ctx = try_tier1_postgresql(database_url)
+    if ctx is None:
+        mem_engine = st.session_state.get(SESSION_ENGINE_KEY)
+        ctx = build_tier2_or_tier3_context(
+            database_url,
+            data_dir=config.data_dir,
+            engine=mem_engine if isinstance(mem_engine, Engine) else None,
+        )
+
+    st.session_state[SESSION_TIER_KEY] = ctx
+    st.session_state[SESSION_ENGINE_KEY] = ctx.engine
+    return ctx
 
 
 def load_feature_wide_table_with_fallback(
     config: ExperimentConfig,
-) -> tuple[pd.DataFrame, str, bool]:
+) -> tuple[pd.DataFrame, DataSourcingContext]:
     """
-    优先 PostgreSQL SQL 宽表；失败则降级本地 CSV。
+    三级容灾抽水后，将 SQL 宽表映射为 LightGBM 建模矩阵。
+    """
+    ctx = resolve_three_tier_data_sourcing(config, reuse_session=True)
+    assert ctx.engine is not None
 
-    Returns
-    -------
-    (df_wide, source_label, postgres_connected)
-    """
-    database_url = os.getenv("MEL_DATABASE_URL", config.database_url or PRODUCTION_DATABASE_URL)
-    try:
-        df_sql = load_postgresql_feature_wide(database_url)
-        df_wide = adapt_sql_pipeline_to_model_frame(df_sql)
-        df_wide = _robust_fill_enhanced_env_features(df_wide)
-        return df_wide, "PostgreSQL · v_features_pipeline_ready", True
-    except (ConnectionError, SQLAlchemyError, ValueError, OSError) as exc:
-        st.warning(f"PostgreSQL 连接/查询失败，启动 CSV 容灾：{type(exc).__name__}: {exc}")
-        df_wide = load_csv_fallback_wide(config.data_dir)
-        label = f"CSV 容灾 · {config.data_dir or _APP_ROOT / 'data'}"
-        return df_wide, label, False
+    df_sql = fetch_sql_pipeline_wide(ctx.engine)
+    df_wide = adapt_sql_pipeline_to_model_frame(df_sql)
+    df_wide = _robust_fill_enhanced_env_features(df_wide)
+    return df_wide, ctx
 
 
 def build_config_from_sidebar() -> tuple[ExperimentConfig, bool, bool, bool]:
@@ -818,24 +1149,14 @@ def main() -> None:
         build_config_from_sidebar()
     )
 
-    # PostgreSQL 连接探测（侧边栏展示，不阻塞页面）
-    pg_connected = False
-    data_source = "未加载"
+    # 三级容灾：页面加载即解析（不阻塞），供 Banner / SQL 架构展示
+    sourcing_ctx: Optional[DataSourcingContext] = None
     if use_postgres and not config.demo:
         try:
-            database_url = os.getenv(
-                "MEL_DATABASE_URL",
-                config.database_url or PRODUCTION_DATABASE_URL,
-            )
-            create_db_engine(database_url)
-            pg_connected = True
-            data_source = "PostgreSQL（待命）"
-        except (ConnectionError, SQLAlchemyError, OSError):
-            pg_connected = False
-            data_source = "PostgreSQL 离线 · 将使用 CSV 容灾"
-
-    if use_postgres:
-        render_postgres_highlights(pg_connected, data_source)
+            sourcing_ctx = resolve_three_tier_data_sourcing(config, reuse_session=True)
+            render_data_tier_banner(sourcing_ctx)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"数据管线初始化失败：{type(exc).__name__}: {exc}")
 
     # 主区也放置醒目运行按钮（与侧边栏联动）
     col_btn, col_info = st.columns([1, 3])
@@ -874,9 +1195,9 @@ def main() -> None:
         st.markdown(
             """
             #### 使用指南
-            1. 默认 **PostgreSQL 生产库**：库内窗口函数实时产出特征宽表（失败自动 CSV 容灾）。  
-            2. 亦可切换 **Demo 模拟** / **SQLite 数据中台** / **真实 CSV 目录**。  
-            3. 调整 **时序划分比例**（默认 80% 训练 / 20% 测试）后点击 **启动双模型打擂台**。  
+            1. 默认 **三级容灾抽水**：PostgreSQL → 内存 SQLite → Mock 自愈（适配 Streamlit Cloud）。  
+            2. 展开 **SQL 窗口函数架构** 可查看完整 ``LAG`` / ``AVG OVER`` 代码与抽样数据。  
+            3. 调整 **时序划分比例** 后点击 **启动双模型打擂台**。  
             """
         )
         return
@@ -884,15 +1205,12 @@ def main() -> None:
     try:
         pipeline_tables = None
         df_wide_preloaded: Optional[pd.DataFrame] = None
-        pg_run_connected = False
 
         if use_postgres and not config.demo:
-            with st.spinner("正在从 PostgreSQL 拉取 v_features_pipeline_ready 窗口特征宽表..."):
-                df_wide_preloaded, src_label, pg_run_connected = (
-                    load_feature_wide_table_with_fallback(config)
-                )
-                st.session_state["data_source"] = src_label
-                render_postgres_highlights(pg_run_connected, src_label)
+            with st.spinner("三级容灾抽水：PG → 内存 SQLite → Mock 自愈..."):
+                df_wide_preloaded, sourcing_ctx = load_feature_wide_table_with_fallback(config)
+                st.session_state["data_source"] = sourcing_ctx.tier_label
+                render_data_tier_banner(sourcing_ctx)
 
         if use_pipeline:
             with st.spinner(
