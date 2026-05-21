@@ -10,3 +10,5 @@ plotly>=5.18
 shap>=0.44
 requests>=2.31
 pyarrow>=14.0
+gymnasium>=0.29
+torch>=2.0
