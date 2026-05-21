@@ -60,6 +60,8 @@ PHYSICS_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 CHUNK_SIZE = 5000
+MIN_INGEST_HOURS = 1536
+DEFAULT_MOCK_NODE = "PJM_HUB"
 
 DDL_MARKET_NODES = """
 CREATE TABLE IF NOT EXISTS market_nodes (
@@ -289,6 +291,56 @@ def load_and_clean_features(csv_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]
     return nodes, facts
 
 
+def synthesize_mock_facts_nodes(n_hours: int = MIN_INGEST_HOURS) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """生成高仿真时序事实表（用于 CSV 稀疏时自动扩容灌库）。"""
+    hours = pd.date_range("2024-01-01", periods=n_hours, freq="h", tz="UTC")
+    rng = np.random.default_rng(42)
+    t = np.arange(n_hours, dtype=float)
+    price_da = 300.0 + 50.0 * np.sin(t / 24.0) + rng.normal(0, 5.0, n_hours)
+    price_rt = price_da + rng.normal(0, 1.5, n_hours)
+    nodes = pd.DataFrame(
+        [
+            {
+                "node_id": DEFAULT_MOCK_NODE,
+                "rto_name": "PJM",
+                "zone_name": "HUB_ZONE",
+                "node_type": "HUB",
+            }
+        ]
+    )
+    facts = pd.DataFrame(
+        {
+            "timestamp": hours.strftime("%Y-%m-%d %H:%M:%S"),
+            "node_id": DEFAULT_MOCK_NODE,
+            "price_da": price_da,
+            "price_rt": price_rt,
+            "system_load": 11000.0 + 500.0 * np.sin(t / 24.0) + rng.normal(0, 80.0, n_hours),
+            "heat_index": 25.0 + rng.normal(0, 1.0, n_hours),
+            "wind_shear_alpha": np.clip(0.15 + rng.normal(0, 0.02, n_hours), 0.05, 0.35),
+            "bifacial_gain_index": 1.0 + rng.normal(0, 0.05, n_hours),
+            "panel_efficiency_discount": np.clip(
+                0.02 + np.cumsum(rng.normal(0, 0.001, n_hours)), 0.0, 0.15
+            ),
+        }
+    )
+    return nodes, facts
+
+
+def ensure_minimum_ingest_rows(
+    nodes: pd.DataFrame,
+    facts: pd.DataFrame,
+    min_hours: int = MIN_INGEST_HOURS,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """事实表行数不足时，切换为大样本仿真时序。"""
+    if len(facts) >= min_hours:
+        return nodes, facts
+    _log(
+        "WARN",
+        f"输入仅 {len(facts)} 行，低于灌库下限 {min_hours}h，自动扩容仿真时序。",
+    )
+    return synthesize_mock_facts_nodes(n_hours=min_hours)
+
+
 # ---------------------------------------------------------------------------
 # PostgreSQL 建表与批量灌入
 # ---------------------------------------------------------------------------
@@ -443,6 +495,7 @@ def run_injection(
         _log("INFO", f"读取特征宽表: {resolved_csv}")
 
         nodes, facts = load_and_clean_features(resolved_csv)
+        nodes, facts = ensure_minimum_ingest_rows(nodes, facts, min_hours=MIN_INGEST_HOURS)
         _log(
             "INFO",
             f"清洗完成 · 节点={len(nodes)} · 事实行={len(facts)} · chunk={chunk_size}",

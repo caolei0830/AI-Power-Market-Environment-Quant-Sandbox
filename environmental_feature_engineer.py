@@ -178,7 +178,7 @@ def _match_stations_to_grid(
     grid_lons = grid[schema.lon].to_numpy(dtype=float)
 
     grid_keys: list[int] = []
-    for lat, lon in zip(station_lats, station_lons, strict=True):
+    for lat, lon in zip(station_lats, station_lons):
         dist = _haversine_distance_m(
             np.array([lat]),
             np.array([lon]),

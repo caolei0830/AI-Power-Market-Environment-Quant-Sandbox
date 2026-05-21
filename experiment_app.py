@@ -42,9 +42,14 @@ from run_experiment import (  # noqa: E402
     BENCHMARK_FEATURE_COLUMNS,
     COL_TIMESTAMP,
     ENHANCED_ENV_COLUMNS,
+    EXPERIMENT_LOOKBACK_HOURS_DEFAULT,
+    EXPERIMENT_LOOKBACK_HOURS_MIN,
     ExperimentConfig,
     ExperimentReport,
     PRODUCTION_DATABASE_URL,
+    build_full_feature_wide_table,
+    effective_lookback_hours,
+    ensure_sufficient_wide_table,
     _pct_alpha,
     _pct_improvement,
     _ensure_feature_view,
@@ -153,7 +158,7 @@ CSV_FALLBACK_CANDIDATES: tuple[Path, ...] = (
     _APP_ROOT / "data" / "feature_ready.csv",
 )
 
-MOCK_SEED_HOURS = 120
+MOCK_SEED_HOURS = EXPERIMENT_LOOKBACK_HOURS_DEFAULT
 DEFAULT_MOCK_NODE = "PJM_HUB"
 SESSION_ENGINE_KEY = "mel_feature_engine"
 SESSION_TIER_KEY = "mel_data_tier"
@@ -310,7 +315,7 @@ def _count_metrics_rows(engine: Engine) -> int:
 
 
 def generate_mock_seed_tables(n_hours: int = MOCK_SEED_HOURS) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """第三级：动态 Mock 120h 仿真时序 + 四大物理因子。"""
+    """第三级：动态 Mock 大样本仿真时序 + 四大物理因子（默认 ≥1536h）。"""
     hours = pd.date_range("2024-01-01", periods=n_hours, freq="h", tz="UTC")
     rng = np.random.default_rng(42)
     t = np.arange(n_hours, dtype=float)
@@ -503,7 +508,7 @@ def build_tier2_or_tier3_context(
             tier=3,
             tier_label="Tier-3 · 内存沙盒 + Mock 自愈灌库",
             banner_message=(
-                "🛡️ Streamlit Cloud 容灾：已启用内存 SQLite 沙盒，并动态 Mock 120 行仿真时序 "
+                f"🛡️ Streamlit Cloud 容灾：已启用内存 SQLite 沙盒，并动态 Mock {MOCK_SEED_HOURS}h 仿真时序 "
                 "（含四大物理因子 + 窗口函数视图）。"
             ),
             postgres_connected=False,
@@ -570,6 +575,8 @@ def load_feature_wide_table_with_fallback(
     df_sql = fetch_sql_pipeline_wide(ctx.engine)
     df_wide = adapt_sql_pipeline_to_model_frame(df_sql)
     df_wide = _robust_fill_enhanced_env_features(df_wide)
+    required = [COL_TARGET] + list(BENCHMARK_FEATURE_COLUMNS) + list(ENHANCED_ENV_COLUMNS)
+    df_wide = ensure_sufficient_wide_table(config, df_wide, required)
     return df_wide, ctx
 
 
@@ -610,6 +617,14 @@ def build_config_from_sidebar() -> tuple[ExperimentConfig, bool, bool, bool]:
             "💡 提示：系统当前已自动触发 720 小时（30天）工业级时序回溯，"
             "确保环境长尾微特征拥有充足的训练样本。"
         )
+    lookback_hours = st.sidebar.number_input(
+        "历史回溯小时数 (lookback_hours)",
+        min_value=EXPERIMENT_LOOKBACK_HOURS_MIN,
+        max_value=8760,
+        value=EXPERIMENT_LOOKBACK_HOURS_DEFAULT,
+        step=24,
+        help=f"不低于 {EXPERIMENT_LOOKBACK_HOURS_MIN}h（30天）；默认 {EXPERIMENT_LOOKBACK_HOURS_DEFAULT}h 保障训练样本 ≥1000。",
+    )
     train_ratio = st.sidebar.slider(
         "时序划分比例（训练集占比）",
         min_value=0.60,
@@ -647,6 +662,7 @@ def build_config_from_sidebar() -> tuple[ExperimentConfig, bool, bool, bool]:
         production_db=use_postgres,
         database_url=pg_url,
         data_dir=data_dir,
+        lookback_hours=int(lookback_hours),
         train_ratio=train_ratio,
         storage_power_mw=power_mw,
         storage_capacity_mwh=capacity_mwh,
@@ -696,8 +712,8 @@ def run_experiment_with_status(
     with st.status("实验引擎运行中...", expanded=True) as status:
         # --- 步骤 1：特征宽表（PostgreSQL SQL / 容灾 CSV / Demo / 数据中台）---
         if df_wide_preloaded is not None:
-            st.write("正在消费 PostgreSQL 窗口特征宽表（v_features_pipeline_ready）...")
-            df_wide = df_wide_preloaded
+            st.write("正在消费 SQL 窗口特征宽表（v_features_pipeline_ready）...")
+            df_wide = ensure_sufficient_wide_table(config, df_wide_preloaded, required_cols)
         elif pipeline_tables is not None:
             st.write("正在调用特征中台对齐空间辐射数据...")
             tables = enrich_market_physics_inputs(pipeline_tables, schema=config.schema)
@@ -707,13 +723,10 @@ def run_experiment_with_status(
             df_wide = add_model_ready_features(df_wide)
             df_wide = _robust_fill_enhanced_env_features(df_wide)
         elif config.demo:
-            st.write("正在生成 Demo 模拟宽表...")
-            tables = build_synthetic_raw_tables()
-            tables = enrich_market_physics_inputs(tables, schema=config.schema)
-            df_wide = build_enhanced_wide_table(tables, schema=config.schema)
-            df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
-            df_wide = add_model_ready_features(df_wide)
-            df_wide = _robust_fill_enhanced_env_features(df_wide)
+            st.write(
+                f"正在生成 Demo 大样本宽表（{effective_lookback_hours(config)}h）..."
+            )
+            df_wide = build_full_feature_wide_table(config)
         else:
             if config.data_dir is None or not config.data_dir.is_dir():
                 raise FileNotFoundError(
@@ -736,6 +749,14 @@ def run_experiment_with_status(
         feature_frame = df_wide[required_cols + [COL_TIMESTAMP]].copy()
         feature_frame = feature_frame.dropna(subset=required_cols).reset_index(drop=True)
         train_df, test_df = temporal_train_test_split(feature_frame, config.train_ratio)
+        st.write(
+            f"建模样本：全量 {len(feature_frame)} 行 · 训练 {len(train_df)} · 测试 {len(test_df)}"
+        )
+        if len(train_df) < config.min_train_samples:
+            raise ValueError(
+                f"训练集仅 {len(train_df)} 条（目标 ≥{config.min_train_samples}）。"
+                f"请增大侧边栏 lookback_hours（当前 {config.lookback_hours}）。"
+            )
 
         # --- 步骤 2：基准模型 ---
         st.write("正在训练基准 LightGBM...")

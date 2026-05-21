@@ -131,12 +131,20 @@ STORAGE_MIN_SOC_RATIO: float = 0.10
 _WATER_LAG_HOURS: tuple[int, ...] = (1, 3, 6, 24)
 _PRICE_LAG_HOURS: tuple[int, ...] = (1, 24)
 
+# 大样本纪律：30 天(720h)为最小回溯；默认 1536h 保障 dropna + 80/20 切分后训练集 ≥ 1000
+EXPERIMENT_LOOKBACK_HOURS_MIN: int = 720
+EXPERIMENT_LOOKBACK_HOURS_DEFAULT: int = 1536
+MIN_TRAIN_SAMPLES: int = 1000
+MIN_MODELING_ROWS: int = 1280
+
 
 @dataclass
 class ExperimentConfig:
     """实验配置。"""
 
     train_ratio: float = 0.80
+    lookback_hours: int = EXPERIMENT_LOOKBACK_HOURS_DEFAULT
+    min_train_samples: int = MIN_TRAIN_SAMPLES
     data_dir: Optional[Path] = None
     demo: bool = False
     production_db: bool = False
@@ -404,11 +412,60 @@ def adapt_sql_pipeline_to_model_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def effective_lookback_hours(config: ExperimentConfig) -> int:
+    """实验有效回溯小时数（不低于 720h，且满足大样本训练下限）。"""
+    return max(
+        config.lookback_hours,
+        EXPERIMENT_LOOKBACK_HOURS_MIN,
+        MIN_MODELING_ROWS + 48,
+    )
+
+
+def count_usable_modeling_rows(
+    df_wide: pd.DataFrame,
+    required_cols: list[str],
+) -> int:
+    """统计 dropna(required_cols) 后可建模行数。"""
+    frame = df_wide[required_cols + [COL_TIMESTAMP]].copy()
+    return len(frame.dropna(subset=required_cols))
+
+
+def build_full_feature_wide_table(config: ExperimentConfig) -> pd.DataFrame:
+    """合成大样本特征宽表（默认 ≥1536h），供样本不足时自动切换。"""
+    hours = effective_lookback_hours(config)
+    tables = build_synthetic_raw_tables(n_hours=hours)
+    tables = enrich_market_physics_inputs(tables, schema=config.schema)
+    df_wide = build_enhanced_wide_table(tables, schema=config.schema)
+    df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
+    df_wide = add_model_ready_features(df_wide)
+    return _robust_fill_enhanced_env_features(df_wide)
+
+
+def ensure_sufficient_wide_table(
+    config: ExperimentConfig,
+    df_wide: pd.DataFrame,
+    required_cols: list[str],
+) -> pd.DataFrame:
+    """若宽表有效行数不足，自动切换为大样本合成管线。"""
+    n_usable = count_usable_modeling_rows(df_wide, required_cols)
+    if n_usable >= MIN_MODELING_ROWS:
+        return df_wide
+    warnings.warn(
+        f"当前有效样本仅 {n_usable} 行（目标 ≥{MIN_MODELING_ROWS}），"
+        f"自动切换 {effective_lookback_hours(config)}h 合成大样本管线。",
+        UserWarning,
+        stacklevel=2,
+    )
+    return build_full_feature_wide_table(config)
+
+
 def build_wide_table_from_production_db(config: ExperimentConfig) -> pd.DataFrame:
-    """生产库 SQL 宽表 → 建模就绪 DataFrame（跳过 CSV 多表特征工程）。"""
+    """生产库 SQL 宽表 → 建模就绪 DataFrame（样本不足则扩容）。"""
     df_sql = load_features_from_production_db(config.database_url, config.node_id)
     df_wide = adapt_sql_pipeline_to_model_frame(df_sql)
-    return _robust_fill_enhanced_env_features(df_wide)
+    df_wide = _robust_fill_enhanced_env_features(df_wide)
+    required = [COL_TARGET] + list(BENCHMARK_FEATURE_COLUMNS) + list(ENHANCED_ENV_COLUMNS)
+    return ensure_sufficient_wide_table(config, df_wide, required)
 
 
 def build_wide_table_from_csv_pipeline(config: ExperimentConfig) -> pd.DataFrame:
@@ -420,7 +477,9 @@ def build_wide_table_from_csv_pipeline(config: ExperimentConfig) -> pd.DataFrame
     df_wide = build_enhanced_wide_table(tables, schema=config.schema)
     df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
     df_wide = add_model_ready_features(df_wide)
-    return _robust_fill_enhanced_env_features(df_wide)
+    df_wide = _robust_fill_enhanced_env_features(df_wide)
+    required = [COL_TARGET] + list(BENCHMARK_FEATURE_COLUMNS) + list(ENHANCED_ENV_COLUMNS)
+    return ensure_sufficient_wide_table(config, df_wide, required)
 
 
 def _read_csv_if_exists(path: Path) -> Optional[pd.DataFrame]:
@@ -648,7 +707,9 @@ def temporal_train_test_split(
             f"样本量 {len(df)} 过小或 train_ratio={train_ratio} 不合理，"
             "无法得到非空的训练集与测试集。"
         )
-    return df.iloc[:split_idx].copy(), df.iloc[split_idx:].copy()
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
+    return train_df, test_df
 
 
 def _ensure_wind_shear_coefficient(df: pd.DataFrame) -> pd.DataFrame:
@@ -862,12 +923,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentReport:
     """执行完整对比实验。"""
     # ---------- 1. 加载特征宽表 ----------
     if config.demo:
-        tables = build_synthetic_raw_tables()
-        tables = enrich_market_physics_inputs(tables, schema=config.schema)
-        df_wide = build_enhanced_wide_table(tables, schema=config.schema)
-        df_wide = merge_frontier_physics_features(df_wide, schema=config.schema)
-        df_wide = add_model_ready_features(df_wide)
-        df_wide = _robust_fill_enhanced_env_features(df_wide)
+        df_wide = build_full_feature_wide_table(config)
     elif config.production_db or config.data_dir is None:
         df_wide = build_wide_table_from_production_db(config)
     else:
@@ -889,6 +945,15 @@ def run_experiment(config: ExperimentConfig) -> ExperimentReport:
     feature_frame = feature_frame.dropna(subset=required_cols).reset_index(drop=True)
 
     train_df, test_df = temporal_train_test_split(feature_frame, config.train_ratio)
+
+    if len(train_df) < config.min_train_samples:
+        raise ValueError(
+            f"训练集仅 {len(train_df)} 条，低于下限 {config.min_train_samples}。"
+            f"请增大 --lookback-hours（当前 {config.lookback_hours}，"
+            f"建议 ≥{EXPERIMENT_LOOKBACK_HOURS_DEFAULT}）或执行 "
+            f"python data_pipeline.py --lookback-hours 720 --export-csv && "
+            f"python db_injector.py --fresh"
+        )
 
     X_train_b, y_train = _sanitize_xy(train_df[benchmark_cols], train_df[COL_TARGET])
     X_train_e, y_train = _sanitize_xy(train_df[enhanced_cols], train_df[COL_TARGET])
@@ -1006,6 +1071,18 @@ def parse_args() -> ExperimentConfig:
         help="按时间顺序的训练集占比（默认 0.80）",
     )
     parser.add_argument(
+        "--lookback-hours",
+        type=int,
+        default=EXPERIMENT_LOOKBACK_HOURS_DEFAULT,
+        help=f"历史回溯小时数（默认 {EXPERIMENT_LOOKBACK_HOURS_DEFAULT}，不低于 {EXPERIMENT_LOOKBACK_HOURS_MIN}）",
+    )
+    parser.add_argument(
+        "--min-train-samples",
+        type=int,
+        default=MIN_TRAIN_SAMPLES,
+        help=f"训练集最小样本量（默认 {MIN_TRAIN_SAMPLES}）",
+    )
+    parser.add_argument(
         "--storage-power-mw",
         type=float,
         default=STORAGE_POWER_MW,
@@ -1025,6 +1102,8 @@ def parse_args() -> ExperimentConfig:
         node_id=args.node_id,
         data_dir=Path(args.data_dir) if args.data_dir else None,
         train_ratio=args.train_ratio,
+        lookback_hours=args.lookback_hours,
+        min_train_samples=args.min_train_samples,
         storage_power_mw=args.storage_power_mw,
         storage_capacity_mwh=args.storage_capacity_mwh,
     )
@@ -1040,6 +1119,8 @@ def main() -> None:
             database_url=config.database_url,
             node_id=config.node_id,
             train_ratio=config.train_ratio,
+            lookback_hours=config.lookback_hours,
+            min_train_samples=config.min_train_samples,
             storage_power_mw=config.storage_power_mw,
             storage_capacity_mwh=config.storage_capacity_mwh,
         )

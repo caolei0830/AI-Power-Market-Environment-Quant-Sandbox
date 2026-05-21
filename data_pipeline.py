@@ -104,7 +104,7 @@ class PipelineConfig:
     root_dir: Path = field(default_factory=lambda: _PROJECT_ROOT / "data_lake")
     db_path: Optional[Path] = None
     parquet_dir: Optional[Path] = None
-    lookback_hours: int = 72
+    lookback_hours: int = 720
     schema: FeatureSchema = field(default_factory=FeatureSchema)
     request_timeout_sec: float = 8.0
     default_lat: float = 30.25
