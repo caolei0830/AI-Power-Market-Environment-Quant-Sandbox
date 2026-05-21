@@ -13,7 +13,12 @@
 ----
     python run_experiment.py --demo
     python run_experiment.py --production-db
+    python run_experiment.py --production-db --lookback-hours 1536   # 1536h 大样本（已验证）
     python run_experiment.py --data-dir ./data   # 遗留 CSV 多表管线
+
+大样本纪律
+----------
+默认 ``lookback_hours=1536``（64 天）；生产验证：PG 灌库 1536 行 → 训练集 1209 条，修复小样本过拟合与储能穿底。
 """
 
 from __future__ import annotations
