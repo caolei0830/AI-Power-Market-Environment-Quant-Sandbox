@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-experiment_app.py — 环境微特征三模型竞技场（基准 / LightGBM / PPO）Streamlit Web 控制台
+experiment_app.py — 多赛道群英会 · 生产级复线实验 Streamlit 控制台
 
 启动方式
 --------
-    pip install streamlit plotly sqlalchemy psycopg2-binary
+    pip install streamlit plotly sqlalchemy psycopg2-binary pyyaml torch gymnasium
     streamlit run experiment_app.py
 
 说明
 ----
-- **三级容灾抽水**：PostgreSQL 生产库 → 云端内存 SQLite 沙盒 → Mock 自愈灌库。
-- 任意层级均自动激活 ``v_features_pipeline_ready`` 窗口函数视图（LAG / AVG OVER）。
-- 适配 Streamlit Cloud（无本地 PG、无 git 数据文件）零配置演示。
+- 主界面：**全复线打擂台** Track A–E（``ExperimentRunner.run_all_tracks``）。
+- Web 触发默认 ``demo=True``，防止生产库长任务导致断连。
+- Session State 固化矩阵 + 六轨累计 PnL，``st.rerun()`` 后指标不丢失。
+- 侧边栏最下方可选展示 ``experiment_config.yaml``（Configuration-as-Code）。
+- 遗留经典三模型擂台折叠于 Expander。
 """
 
 from __future__ import annotations
@@ -80,6 +82,11 @@ from environmental_feature_engineer import (  # noqa: E402
     FeatureSchema,
     enrich_market_physics_inputs,
     merge_frontier_physics_features,
+)
+from experiment_loader import (  # noqa: E402
+    ExperimentRunner,
+    LGBM_TRACK_ORDER,
+    PPO_TRACK_NAME,
 )
 
 # 工业级默认回溯窗口：30 天 × 24h，保证 LightGBM 有足够样本学习环境长尾微特征
@@ -170,6 +177,11 @@ SESSION_EXPERIMENT_RUN = "experiment_executed"
 SESSION_PPO_REPORT = "mel_ppo_report"
 SESSION_ARENA_PNL = "mel_arena_pnl_df"
 SESSION_PPO_EXECUTED = "ppo_executed"
+SESSION_MULTITRACK_EXECUTED = "multitrack_executed"
+SESSION_MULTITRACK_MATRIX = "multitrack_matrix"
+SESSION_MULTITRACK_PNL = "multitrack_pnl_df"
+
+EXPERIMENT_CONFIG_PATH = _APP_ROOT / "experiment_config.yaml"
 
 PPO_WEB_EPOCHS = 5
 PPO_WEB_ROLLOUT = 256
@@ -222,6 +234,32 @@ LOCALES: dict[str, dict[str, str]] = {
         "ppo_need_lgbm": "请先运行三模型竞技场主实验（LightGBM 擂台），再启动 PPO 智能体。",
         "ppo_missing_torch": "未安装 PyTorch / Gymnasium。请执行: pip install torch gymnasium",
         "ppo_reset": "🔄 重置 PPO 实验 / Reset PPO",
+        "view_yaml": "查看复线 YAML 配置",
+        "multi_track_title": "📊 生产级复线实验终极对照大盘 / Multi-Track Empirical Summary",
+        "run_pipeline": "🚀 启动全复线打擂台流水线 (Execute Full Multi-Track Pipeline)",
+        "view_yaml_btn": "🛠️ 查看复线实验配置契约 (View Multi-Track YAML)",
+        "track_name": "实验赛道 (Track Runway)",
+        "rmse": "RMSE",
+        "r2": "R²",
+        "revenue": "储能综合套利收益 (Revenue CNY)",
+        "track_summary": "复线实验终极对照大盘",
+        "ablation_panel": "消融与鲁棒性验证跑道",
+        "multitrack_btn": "🚀 启动生产级全复线打擂台 (Execute Full Multi-Track Pipeline)",
+        "multitrack_spinner": "复线控制核运行中：Track A → E（LightGBM + PPO）...",
+        "multitrack_done": "全复线打擂台已完成，结果已锁入 Session State",
+        "multitrack_fail": "复线实验失败：{exc}",
+        "multitrack_reset": "🔄 重置复线实验 / Reset Multi-Track",
+        "legacy_arena_expander": "📊 经典三模型擂台（LightGBM 双模 + PPO，遗留）",
+        "curve_track_a": "Track A · 基准线 (Baseline)",
+        "curve_track_b": "Track B · 微特征全开 (Full Env)",
+        "curve_track_c1": "Track C1 · 辐射消融 (Radiation)",
+        "curve_track_c2": "Track C2 · 污染消融 (Pollution)",
+        "curve_track_c3": "Track C3 · 水温消融 (SST)",
+        "curve_track_d": "Track D · 马尔可夫扰动 (Robustness)",
+        "curve_track_e": "Track E · PyTorch PPO 智能体",
+        "multitrack_pnl_title": "复线财富曲线对决 (Multi-Track Cumulative PnL Showdown)",
+        "col_track_id": "轨道",
+        "col_revenue": "储能收益(元)",
         "arena_title": "### 🏆 终极三模型竞技场 (3-Model Arena Showdown)",
         "arena_caption": "固定基准策略 · LightGBM 环境增强 · PyTorch PPO 深度强化学习 — 同一测试集储能套利正面对决",
         "storage_bench": "储能套利（基准）",
@@ -265,9 +303,9 @@ LOCALES: dict[str, dict[str, str]] = {
         "pipeline_banner": "**💡 提示：**系统当前已自动触发 **720 小时（30天）** 工业级时序回溯，确保环境长尾微特征拥有充足的训练样本。",
         "guide_title": "#### 使用指南",
         "guide_body": (
-            "1. 默认 **三级容灾抽水**：PostgreSQL → 内存 SQLite → Mock 自愈（适配 Streamlit Cloud）。  \n"
-            "2. 点击 **启动三模型竞技场** 运行基准 vs LightGBM 擂台。  \n"
-            "3. 再点击 **PPO 智能体打擂台**（轻量 5 Epochs）解锁累计 PnL 三曲线对比与 MDP 文档。"
+            "1. 默认 **三级容灾抽水**：PostgreSQL → 内存 SQLite → Mock 自愈。  \n"
+            "2. 点击 **启动生产级全复线打擂台** 运行 Track A–E 对照矩阵。  \n"
+            "3. 展开 **经典三模型擂台** 可运行遗留 LightGBM 双模流程。"
         ),
         "tier_spinner": "三级容灾抽水：PG → 内存 SQLite → Mock 自愈...",
         "pipeline_spinner": "正在执行 {hours}h（30天）数据中台日更并加载样本...",
@@ -368,6 +406,32 @@ LOCALES: dict[str, dict[str, str]] = {
         "ppo_need_lgbm": "Run the main 3-Model Arena experiment (LightGBM) before launching PPO.",
         "ppo_missing_torch": "PyTorch / Gymnasium not installed. Run: pip install torch gymnasium",
         "ppo_reset": "🔄 Reset PPO experiment / Reset",
+        "view_yaml": "View multi-track YAML config",
+        "multi_track_title": "📊 Multi-Track Empirical Summary / 生产级复线实验终极对照大盘",
+        "run_pipeline": "🚀 Execute Full Multi-Track Pipeline (启动全复线打擂台流水线)",
+        "view_yaml_btn": "🛠️ View Multi-Track YAML (查看复线实验配置契约)",
+        "track_name": "Track Runway (实验赛道)",
+        "rmse": "RMSE",
+        "r2": "R²",
+        "revenue": "Storage arbitrage revenue (Revenue CNY)",
+        "track_summary": "Multi-Track Empirical Summary",
+        "ablation_panel": "Ablation & Robustness Arena",
+        "multitrack_btn": "🚀 Execute Full Multi-Track Pipeline",
+        "multitrack_spinner": "Running tracks A → E (LightGBM + PPO)...",
+        "multitrack_done": "Multi-track pipeline complete — results locked in session",
+        "multitrack_fail": "Multi-track pipeline failed: {exc}",
+        "multitrack_reset": "🔄 Reset multi-track / Reset",
+        "legacy_arena_expander": "📊 Classic 3-model arena (legacy LightGBM + PPO)",
+        "curve_track_a": "Track A · Baseline",
+        "curve_track_b": "Track B · Full environmental features",
+        "curve_track_c1": "Track C1 · Radiation ablation",
+        "curve_track_c2": "Track C2 · Pollution ablation",
+        "curve_track_c3": "Track C3 · SST ablation",
+        "curve_track_d": "Track D · Markov noise robustness",
+        "curve_track_e": "Track E · PyTorch PPO agent",
+        "multitrack_pnl_title": "Multi-Track Cumulative PnL Showdown",
+        "col_track_id": "Track",
+        "col_revenue": "Storage revenue (CNY)",
         "arena_title": "### 🏆 Ultimate 3-Model Arena Showdown",
         "arena_caption": "Benchmark optimizer · LightGBM enhanced forecast · PyTorch PPO DRL — same test-set storage arbitrage",
         "storage_bench": "Storage arbitrage (Benchmark)",
@@ -411,9 +475,9 @@ LOCALES: dict[str, dict[str, str]] = {
         "pipeline_banner": "**💡 Tip:** 720-hour (30-day) lookback is enabled for industrial-grade environmental time series.",
         "guide_title": "#### Quick Start",
         "guide_body": (
-            "1. Default **3-tier pipeline**: PostgreSQL → in-memory SQLite → mock self-heal (Streamlit Cloud ready).  \n"
-            "2. Click **Run 3-Model Arena** for benchmark vs LightGBM.  \n"
-            "3. Then click **Execute PPO** (5 lightweight epochs) for cumulative PnL curves & MDP docs."
+            "1. Default **3-tier pipeline**: PostgreSQL → in-memory SQLite → mock self-heal.  \n"
+            "2. Click **Execute Full Multi-Track Pipeline** for tracks A–E.  \n"
+            "3. Open **Classic 3-model arena** for the legacy dual LightGBM flow."
         ),
         "tier_spinner": "3-tier sourcing: PG → memory SQLite → mock self-heal...",
         "pipeline_spinner": "Running {hours}h (30d) data-lake daily update & load...",
@@ -502,6 +566,8 @@ def init_session_state() -> None:
         st.session_state[SESSION_PPO_EXECUTED] = False
     if SESSION_EXPERIMENT_RUN not in st.session_state:
         st.session_state[SESSION_EXPERIMENT_RUN] = False
+    if SESSION_MULTITRACK_EXECUTED not in st.session_state:
+        st.session_state[SESSION_MULTITRACK_EXECUTED] = False
 
 
 @dataclass
@@ -1947,6 +2013,210 @@ def render_frontier_shap_panel(report: ExperimentReport, lang: str) -> None:
         )
 
 
+def render_sidebar_yaml_viewer(lang: str) -> None:
+    """侧边栏最下方：Configuration-as-Code 契约原文。"""
+    st.sidebar.markdown("---")
+    if st.sidebar.checkbox(
+        t(lang, "view_yaml_btn"),
+        key="view_yaml_config",
+    ):
+        if EXPERIMENT_CONFIG_PATH.is_file():
+            st.sidebar.code(
+                EXPERIMENT_CONFIG_PATH.read_text(encoding="utf-8"),
+                language="yaml",
+            )
+        else:
+            st.sidebar.warning(f"Missing: {EXPERIMENT_CONFIG_PATH}")
+
+
+def _style_multitrack_matrix(df: pd.DataFrame, lang: str) -> "pd.io.formats.style.Styler":
+    """对照表行级高亮：储能收益最高行绿色，PPO 行紫色底纹。"""
+    if df.empty:
+        return df.style
+
+    display = _rename_matrix_for_display(df.copy(), lang)
+    rev_col = t(lang, "revenue")
+    raw_rev = "storage_revenue_cny"
+    max_rev = (
+        float(df[raw_rev].max())
+        if raw_rev in df.columns and len(df) > 0
+        else 0.0
+    )
+
+    def _row_style(row: pd.Series) -> list[str]:
+        styles = [""] * len(row)
+        idx = row.name
+        if raw_rev in df.columns and idx in df.index:
+            if df.loc[idx, raw_rev] == max_rev and max_rev > 0:
+                styles = ["background-color: #dcfce7; font-weight: 700"] * len(row)
+        if idx in df.index and str(df.loc[idx, "track_id"]).upper() == "E":
+            styles = ["background-color: #f3e8ff"] * len(row)
+        return styles
+
+    fmt = {
+        t(lang, "rmse"): "{:.2f}",
+        "mae": "{:.2f}",
+        t(lang, "r2"): "{:.4f}",
+        t(lang, "revenue"): "{:,.0f}",
+        "profitable_hour_ratio": "{:.1%}",
+        "alpha_vs_idle_pct": "{:+.2f}%",
+    }
+    return display.style.format({k: v for k, v in fmt.items() if k in display.columns}).apply(
+        _row_style, axis=1
+    )
+
+
+_MULTITRACK_CURVE_STYLES: dict[str, tuple[str, str, str]] = {
+    "cum_A": ("curve_track_a", "#dc2626", "dot"),
+    "cum_B": ("curve_track_b", "#2563eb", "solid"),
+    "cum_C1": ("curve_track_c1", "#06b6d4", "dash"),
+    "cum_C2": ("curve_track_c2", "#10b981", "dash"),
+    "cum_C3": ("curve_track_c3", "#f97316", "dash"),
+    "cum_D": ("curve_track_d", "#16a34a", "solid"),
+    "cum_E": ("curve_track_e", "#eab308", "solid"),
+}
+
+
+def build_full_multitrack_pnl_dataframe(runner: ExperimentRunner) -> pd.DataFrame:
+    """合并 Track A–E 全部累计财富曲线（六轨宽表，供 Plotly 神图）。"""
+    if not runner._pnl_traces:
+        return runner.build_multitrack_pnl_dataframe()
+
+    ts_col = runner.timestamp_column
+    base_key = LGBM_TRACK_ORDER[0]
+    if base_key not in runner._pnl_traces:
+        base_key = next(iter(runner._pnl_traces))
+
+    out = runner._pnl_traces[base_key][[ts_col]].copy()
+    for track_name in (*LGBM_TRACK_ORDER, PPO_TRACK_NAME):
+        if track_name not in runner._pnl_traces:
+            continue
+        tid = str(runner._tracks.get(track_name, {}).get("id", track_name))
+        trace = runner._pnl_traces[track_name]
+        n = min(len(out), len(trace))
+        out[f"cum_{tid}"] = trace["cumulative_pnl"].values[:n]
+
+    return out
+
+
+def plot_multitrack_pnl_showdown(pnl_df: pd.DataFrame, *, lang: str) -> go.Figure:
+    """六曲线神级打擂台：A 红 / B 蓝 / C 消融 / D 绿 / E 金。"""
+    fig = go.Figure()
+    ts_col = COL_TIMESTAMP if COL_TIMESTAMP in pnl_df.columns else pnl_df.columns[0]
+
+    ordered_cols = [c for c in _MULTITRACK_CURVE_STYLES if c in pnl_df.columns]
+    extra = [c for c in pnl_df.columns if c.startswith("cum_") and c not in ordered_cols]
+    for col in ordered_cols + extra:
+        if col in _MULTITRACK_CURVE_STYLES:
+            locale_key, color, dash = _MULTITRACK_CURVE_STYLES[col]
+            label = t(lang, locale_key)
+            width = 3.2 if col in ("cum_A", "cum_B", "cum_D", "cum_E") else 2.0
+        else:
+            label = col
+            color = "#64748b"
+            dash = "dot"
+            width = 1.8
+        fig.add_trace(
+            go.Scatter(
+                x=pnl_df[ts_col],
+                y=pnl_df[col],
+                name=label,
+                line=dict(color=color, width=width, dash=dash),
+            )
+        )
+
+    fig.update_layout(
+        title=t(lang, "multitrack_pnl_title"),
+        xaxis_title=t(lang, "chart_time"),
+        yaxis_title=t(lang, "chart_cum_pnl_y"),
+        template="plotly_white",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=580,
+    )
+    return fig
+
+
+def run_multitrack_pipeline(
+    config: ExperimentConfig,
+    *,
+    lang: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    后台调度 ExperimentRunner.run_all_tracks()。
+
+    Web 端固定 ``demo=True``，避免生产库长耗时导致 Streamlit 断连。
+    """
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+    runner = ExperimentRunner(
+        EXPERIMENT_CONFIG_PATH,
+        production_db=False,
+        demo=True,
+    )
+    runner.experiment_config.train_ratio = config.train_ratio
+    runner.experiment_config.lookback_hours = min(
+        int(config.lookback_hours),
+        int(runner.experiment_config.lookback_hours),
+    )
+    runner.experiment_config.storage_power_mw = config.storage_power_mw
+    runner.experiment_config.storage_capacity_mwh = config.storage_capacity_mwh
+
+    matrix = runner.run_all_tracks(include_ppo=True, skip_ppo_if_missing_torch=True)
+    pnl_df = build_full_multitrack_pnl_dataframe(runner)
+    return matrix, pnl_df
+
+
+def _rename_matrix_for_display(matrix: pd.DataFrame, lang: str) -> pd.DataFrame:
+    """对照矩阵列名 → 国际化展示名。"""
+    rename_map = {
+        "track_name": t(lang, "track_name"),
+        "rmse": t(lang, "rmse"),
+        "r2": t(lang, "r2"),
+        "storage_revenue_cny": t(lang, "revenue"),
+    }
+    return matrix.rename(columns={k: v for k, v in rename_map.items() if k in matrix.columns})
+
+
+def render_multitrack_dashboard(lang: str) -> None:
+    """复线流水线结果看板（Session State 固化后渲染）。"""
+    matrix: Optional[pd.DataFrame] = st.session_state.get(SESSION_MULTITRACK_MATRIX)
+    pnl_df: Optional[pd.DataFrame] = st.session_state.get(SESSION_MULTITRACK_PNL)
+
+    if matrix is None or matrix.empty:
+        return
+
+    st.success(t(lang, "multitrack_done"))
+
+    m1, m2, m3, m4 = st.columns(4)
+    best = matrix.loc[matrix["storage_revenue_cny"].idxmax()]
+    m1.metric(t(lang, "track_name"), str(best.get("track_name", "—")))
+    rmse_val = best.get("rmse")
+    m2.metric(t(lang, "rmse"), f"{rmse_val:.2f}" if pd.notna(rmse_val) else "—")
+    r2_val = best.get("r2")
+    m3.metric(t(lang, "r2"), f"{r2_val:.4f}" if pd.notna(r2_val) else "—")
+    m4.metric(t(lang, "revenue"), f"¥{float(best['storage_revenue_cny']):,.0f}")
+
+    st.dataframe(
+        _style_multitrack_matrix(matrix, lang),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if pnl_df is not None and not pnl_df.empty:
+        st.plotly_chart(
+            plot_multitrack_pnl_showdown(pnl_df, lang=lang),
+            use_container_width=True,
+        )
+
+    if st.button(t(lang, "multitrack_reset"), key="multitrack_reset_btn"):
+        st.session_state[SESSION_MULTITRACK_EXECUTED] = False
+        st.session_state.pop(SESSION_MULTITRACK_MATRIX, None)
+        st.session_state.pop(SESSION_MULTITRACK_PNL, None)
+        st.rerun()
+
+
 def render_charts(report: ExperimentReport, lang: str) -> None:
     """渲染 Plotly 图表区。"""
     if report.test_forecast is None or report.enhanced_full_importance is None:
@@ -2005,85 +2275,120 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             st.error(t(lang, "data_init_error", exc=f"{type(exc).__name__}: {exc}"))
 
-    # 主区也放置醒目运行按钮（与侧边栏联动）
-    col_btn, col_info = st.columns([1, 3])
-    with col_btn:
-        main_run = st.button(
-            t(lang, "run_button"),
-            type="primary",
-            use_container_width=True,
-        )
-    with col_info:
-        if config.demo:
-            mode_label = t(lang, "mode_demo")
-        elif use_postgres:
-            mode_label = t(lang, "mode_postgres", url=config.database_url)
-        elif use_pipeline:
-            mode_label = t(lang, "mode_sqlite")
-        else:
-            mode_label = t(lang, "mode_csv", path=config.data_dir)
-        st.info(
-            t(lang, "mode_info", mode=mode_label, ratio=config.train_ratio)
-        )
-
     if use_pipeline:
         st.markdown(
             f'<div style="padding:0.75rem 1rem; background:#ecfdf5; border-left:4px solid #16a34a; border-radius:6px; margin-bottom:1rem;">{t(lang, "pipeline_banner")}</div>',
             unsafe_allow_html=True,
         )
 
-    if run_clicked or main_run:
-        st.session_state[SESSION_PPO_EXECUTED] = False
-        st.session_state.pop(SESSION_PPO_REPORT, None)
-        st.session_state.pop(SESSION_ARENA_PNL, None)
+    # ------------------------------------------------------------------
+    # 主界面：多赛道群英会 · 复线流水线（Session State 状态死锁）
+    # ------------------------------------------------------------------
+    st.markdown(f"## {t(lang, 'multi_track_title')}")
+    st.caption(t(lang, "ablation_panel"))
 
-        try:
-            pipeline_tables = None
-            df_wide_preloaded: Optional[pd.DataFrame] = None
+    if st.button(
+        t(lang, "run_pipeline"),
+        type="primary",
+        use_container_width=True,
+        key="multitrack_run_button",
+    ):
+        st.session_state[SESSION_MULTITRACK_EXECUTED] = True
+        st.session_state.pop(SESSION_MULTITRACK_MATRIX, None)
+        st.session_state.pop(SESSION_MULTITRACK_PNL, None)
+        st.rerun()
 
-            if use_postgres and not config.demo:
-                with st.spinner(t(lang, "tier_spinner")):
-                    df_wide_preloaded, sourcing_ctx = load_feature_wide_table_with_fallback(
-                        config
-                    )
-                    st.session_state["data_source"] = tier_label_for(
-                        lang, sourcing_ctx.tier
-                    )
-                    render_data_tier_banner(sourcing_ctx, lang)
-
-            if use_pipeline:
-                with st.spinner(
-                    t(lang, "pipeline_spinner", hours=PIPELINE_LOOKBACK_HOURS)
-                ):
-                    pipeline_tables = load_tables_from_pipeline(
-                        run_update=pipeline_refresh,
-                        lookback_hours=PIPELINE_LOOKBACK_HOURS,
-                        lang=lang,
-                    )
-            report = run_experiment_with_status(
-                config,
-                pipeline_tables=pipeline_tables,
-                df_wide_preloaded=df_wide_preloaded,
-                lang=lang,
-            )
-            st.session_state[SESSION_EXPERIMENT_REPORT] = report
-            st.session_state[SESSION_EXPERIMENT_RUN] = True
-        except Exception as exc:
-            st.error(t(lang, "experiment_fail", exc=f"{type(exc).__name__}: {exc}"))
-            st.exception(exc)
-            return
-
-    if not st.session_state.get(SESSION_EXPERIMENT_RUN):
+    if st.session_state.get(SESSION_MULTITRACK_EXECUTED):
+        if st.session_state.get(SESSION_MULTITRACK_MATRIX) is None:
+            try:
+                with st.spinner(t(lang, "multitrack_spinner")):
+                    matrix, pnl_df = run_multitrack_pipeline(config, lang=lang)
+                st.session_state[SESSION_MULTITRACK_MATRIX] = matrix
+                st.session_state[SESSION_MULTITRACK_PNL] = pnl_df
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(t(lang, "multitrack_fail", exc=f"{type(exc).__name__}: {exc}"))
+                st.exception(exc)
+                st.session_state[SESSION_MULTITRACK_EXECUTED] = False
+                return
+        render_multitrack_dashboard(lang)
+    else:
         st.markdown(f"{t(lang, 'guide_title')}\n{t(lang, 'guide_body')}")
-        return
 
-    report = st.session_state[SESSION_EXPERIMENT_REPORT]
-    render_experiment_dashboard(
-        report,
-        config,
-        lang,
-        use_postgres=use_postgres,
-    )
+    # ------------------------------------------------------------------
+    # 遗留：经典三模型擂台（可折叠）
+    # ------------------------------------------------------------------
+    with st.expander(t(lang, "legacy_arena_expander"), expanded=False):
+        col_btn, col_info = st.columns([1, 3])
+        with col_btn:
+            main_run = st.button(
+                t(lang, "run_button"),
+                type="secondary",
+                use_container_width=True,
+                key="legacy_run_button",
+            )
+        with col_info:
+            if config.demo:
+                mode_label = t(lang, "mode_demo")
+            elif use_postgres:
+                mode_label = t(lang, "mode_postgres", url=config.database_url)
+            elif use_pipeline:
+                mode_label = t(lang, "mode_sqlite")
+            else:
+                mode_label = t(lang, "mode_csv", path=config.data_dir)
+            st.info(t(lang, "mode_info", mode=mode_label, ratio=config.train_ratio))
+
+        if run_clicked or main_run:
+            st.session_state[SESSION_PPO_EXECUTED] = False
+            st.session_state.pop(SESSION_PPO_REPORT, None)
+            st.session_state.pop(SESSION_ARENA_PNL, None)
+
+            try:
+                pipeline_tables = None
+                df_wide_preloaded: Optional[pd.DataFrame] = None
+
+                if use_postgres and not config.demo:
+                    with st.spinner(t(lang, "tier_spinner")):
+                        df_wide_preloaded, sourcing_ctx = (
+                            load_feature_wide_table_with_fallback(config)
+                        )
+                        st.session_state["data_source"] = tier_label_for(
+                            lang, sourcing_ctx.tier
+                        )
+                        render_data_tier_banner(sourcing_ctx, lang)
+
+                if use_pipeline:
+                    with st.spinner(
+                        t(lang, "pipeline_spinner", hours=PIPELINE_LOOKBACK_HOURS)
+                    ):
+                        pipeline_tables = load_tables_from_pipeline(
+                            run_update=pipeline_refresh,
+                            lookback_hours=PIPELINE_LOOKBACK_HOURS,
+                            lang=lang,
+                        )
+                report = run_experiment_with_status(
+                    config,
+                    pipeline_tables=pipeline_tables,
+                    df_wide_preloaded=df_wide_preloaded,
+                    lang=lang,
+                )
+                st.session_state[SESSION_EXPERIMENT_REPORT] = report
+                st.session_state[SESSION_EXPERIMENT_RUN] = True
+            except Exception as exc:  # noqa: BLE001
+                st.error(t(lang, "experiment_fail", exc=f"{type(exc).__name__}: {exc}"))
+                st.exception(exc)
+                return
+
+        if st.session_state.get(SESSION_EXPERIMENT_RUN):
+            report = st.session_state[SESSION_EXPERIMENT_REPORT]
+            render_experiment_dashboard(
+                report,
+                config,
+                lang,
+                use_postgres=use_postgres,
+            )
+
+    render_sidebar_yaml_viewer(lang)
 
 
 if __name__ == "__main__":

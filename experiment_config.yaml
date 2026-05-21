@@ -1,0 +1,268 @@
+# =============================================================================
+# MEL-F 复线实验配置中心 (Multi-Track Experiment Control Plane)
+# =============================================================================
+# 与 run_experiment.py / vpp_environment.py / ppo_agent.py 列名契约对齐。
+# 切分纪律：严禁随机 shuffle，仅允许按时间顺序划分训练 / 测试集。
+# =============================================================================
+
+schema_version: "1.0.0"
+project: "AI-Power-Market-Environment-Quant-Sandbox"
+description: >
+  环境微特征电力现货预测 · 六轨复线消融与三模型竞技场（基准优化器 / LightGBM / PPO DRL）
+
+# -----------------------------------------------------------------------------
+# 1. 全局锁定 (Global Reproducibility & Temporal Discipline)
+# -----------------------------------------------------------------------------
+global:
+  random_seed: 42
+  target_column: spot_price          # 结算标签；SQL 视图映射自 price_rt
+  timestamp_column: timestamp
+  node_id: PJM_HUB
+
+  # 大样本纪律（与生产管线一致）
+  lookback_hours: 1536               # 64 天 × 24h
+  min_modeling_rows: 1280
+  min_train_samples: 1000
+
+  # 时序切分（主模式：1536h 前 80% 训练 / 后 20% 测试）
+  split:
+    method: chronological_ratio      # chronological_ratio | calendar_range
+    train_ratio: 0.80
+    shuffle: false                   # 硬性禁止未来信息泄露
+    # 可选日历锚点（当 method=calendar_range 时启用；与 ratio 二选一）
+    calendar_fallback:
+      train_start: "2022-01-01T00:00:00Z"
+      train_end: "2023-12-31T23:00:00Z"
+      test_start: "2024-01-01T00:00:00Z"
+      test_end: null                 # null = 至序列末尾
+
+  data_source:
+    production_db: true
+    database_url_env: MEL_DATABASE_URL
+    feature_view: v_features_pipeline_ready
+    tier_fallback:                  # PostgreSQL → memory_sqlite → synthetic
+      - postgresql
+      - memory_sqlite_mock
+      - synthetic_pipeline
+
+# -----------------------------------------------------------------------------
+# 2. 储能优化器与物理约束 (Storage Optimizer & Physics)
+# -----------------------------------------------------------------------------
+storage:
+  rated_power_mw: 50.0
+  capacity_mwh: 200.0
+  round_trip_efficiency: 0.92        # η；充放电 SOC 动力学用此效率
+  cycle_degradation_cost_cny_per_mwh: 50.0
+  min_soc_ratio: 0.10
+  horizon_hours: 24                  # 滚动优化窗口（与 backtest 一致）
+  action_bounds_mw: [-50.0, 50.0]    # 正=放电，负=充电
+  optimizer_backend: scipy_slsqp       # scipy_slsqp | power_quant（若可用）
+
+# -----------------------------------------------------------------------------
+# 3. LightGBM 分位数回归超参 (Quantile Forecasting — P50)
+# -----------------------------------------------------------------------------
+models:
+  lightgbm:
+    framework: lightgbm
+    objective: quantile
+    alpha: 0.5                       # 50% 分位数 → 中位数电价预测
+    n_estimators: 200
+    learning_rate: 0.05
+    max_depth: 8
+    num_leaves: 64
+    subsample: 0.85
+    colsample_bytree: 0.85
+    reg_lambda: 1.0
+    random_state: 42                 # 与 global.random_seed 对齐
+    n_jobs: 1
+    early_stopping_rounds: 30
+
+# -----------------------------------------------------------------------------
+# 4. 特征词典 (Feature Lexicon — 供复线轨道引用)
+# -----------------------------------------------------------------------------
+feature_lexicon:
+  # A 轨：日前/实时基础特征（消融基准）
+  baseline_market:
+    - spot_price_lag_1h              # SQL: price_rt_lag_1h
+    - spot_price_lag_24h             # 等价业务名 lmp_lag_24h
+    - total_load                     # SQL: system_load
+    - wind_forecast
+    - solar_forecast
+    - temperature
+    - wind_speed
+
+  # 辐射类微特征
+  radiation:
+    - effective_pv_radiation
+    - radiation_mutation_rate
+    - bifacial_gain_index
+    - snow_melt_rate
+
+  # 污染类微特征
+  pollution:
+    - pm25_load_cross_prov_weighted
+
+  # 水温（海温 SST 代理）时滞
+  sea_surface_temperature:
+    - water_temp_lag_1h
+    - water_temp_lag_3h
+    - water_temp_lag_6h
+    - water_temp_lag_24h
+
+  # 四大前沿物理板块（全量环境增强）
+  frontier_physics:
+    - heat_index
+    - heat_index_spike_35
+    - wind_shear_coefficient
+    - wind_shear_alpha
+    - wind_shear_risk
+    - wind_dir_dev
+    - wake_effect_intensity
+    - panel_dirt_accumulation
+    - panel_efficiency_discount
+
+  # B 轨全量环境 = baseline + radiation + pollution + sst + frontier_physics
+  full_env_derived:
+    includes:
+      - baseline_market
+      - radiation
+      - pollution
+      - sea_surface_temperature
+      - frontier_physics
+
+# -----------------------------------------------------------------------------
+# 5. 六轨复线矩阵 (Tracks Matrix — Ablation & Robustness)
+# -----------------------------------------------------------------------------
+tracks:
+  A_baseline:
+    id: A
+    name: "Baseline Market Only"
+    description: "仅日前/实时基础特征，作为全部消融实验的锚点基准。"
+    model_family: lightgbm
+    features:
+      use: baseline_market
+    storage_backtest: true
+
+  B_full_env:
+    id: B
+    name: "Full Environmental Micro-Features"
+    description: "A + 辐射突变 + PM2.5 交叉项 + 水温时滞 + 四大前沿物理因子。"
+    model_family: lightgbm
+    features:
+      use: full_env_derived
+    storage_backtest: true
+
+  C1_radiation_only:
+    id: C1
+    name: "Ablation — Radiation Only"
+    description: "A + 辐射类因子（PV 有效辐射、突变率、双面增益、融雪等）。"
+    model_family: lightgbm
+    features:
+      use:
+        - baseline_market
+        - radiation
+    storage_backtest: true
+
+  C2_pollution_only:
+    id: C2
+    name: "Ablation — Pollution Only"
+    description: "A + 污染跨省负荷交叉项（PM2.5 load cross-prov weighted）。"
+    model_family: lightgbm
+    features:
+      use:
+        - baseline_market
+        - pollution
+    storage_backtest: true
+
+  C3_sst_only:
+    id: C3
+    name: "Ablation — Sea-Surface Temperature Lags Only"
+    description: "A + 水温时滞特征（1h / 3h / 6h / 24h）。"
+    model_family: lightgbm
+    features:
+      use:
+        - baseline_market
+        - sea_surface_temperature
+    storage_backtest: true
+
+  D_robustness_noise:
+    id: D
+    name: "Robustness — Markov Feature Noise"
+    description: "以 B 为底座，对物理微特征施加 ±5% 马尔可夫扰动，检验策略稳定性。"
+    model_family: lightgbm
+    features:
+      base_track: B_full_env
+      use: full_env_derived
+    robustness:
+      enabled: true
+      noise:
+        distribution: markov_uniform
+        relative_pct: 0.05           # ±5%
+        seed: 42
+        apply_to_groups:
+          - radiation
+          - pollution
+          - sea_surface_temperature
+          - frontier_physics
+    storage_backtest: true
+
+  E_ppo_drl:
+    id: E
+    name: "Deep RL — PyTorch PPO VPP Control"
+    description: >
+      深度强化学习控制轨道；共享 SQL 窗口特征观测流（benchmark + full env + SOC），
+      奖励为现货结算 PnL 减电池退化惩罚。
+    model_family: pytorch_ppo
+    framework: pytorch_ppo
+    features:
+      observation: full_env_derived  # 与 vpp_environment.VPP_FEATURE_COLUMNS 对齐
+      include_soc_ratio: true
+    ppo:
+      hidden_dim: 256
+      learning_rate: 0.0003
+      gamma: 0.99
+      gae_lambda: 0.95
+      clip_eps: 0.2
+      entropy_coef: 0.01
+      total_epochs_web: 5              # Streamlit 轻量训练
+      total_epochs_cli: 60
+      rollout_steps: 512
+      policy_artifact: artifacts/vpp_ppo_policy.pt
+    storage_backtest: true             # 动作策略回测，非价格预测
+
+# -----------------------------------------------------------------------------
+# 6. 竞技场编排 (Arena Orchestration — Web / CLI)
+# -----------------------------------------------------------------------------
+arena:
+  enabled: true
+  contenders:
+    - id: bench_optimizer
+      label: "固定基准策略 (Benchmark Optimizer)"
+      track: A_baseline
+      role: storage_arbitrage_on_forecast
+    - id: lightgbm_enhanced
+      label: "LightGBM 预测策略 (ML Forecast)"
+      track: B_full_env
+      role: storage_arbitrage_on_forecast
+    - id: ppo_drl
+      label: "PPO 智能体动作策略 (PyTorch DRL)"
+      track: E_ppo_drl
+      role: direct_power_control
+  metrics:
+    - rmse
+    - mae
+    - r2
+    - storage_revenue_cny
+    - profitable_hour_ratio
+    - alpha_vs_idle_pct
+  cumulative_pnl_chart: true
+
+# -----------------------------------------------------------------------------
+# 7. 报告与产物 (Artifacts)
+# -----------------------------------------------------------------------------
+artifacts:
+  output_dir: artifacts
+  ppo_checkpoint: artifacts/vpp_ppo_policy.pt
+  export_formats:
+    - json
+    - csv
